@@ -27,8 +27,9 @@ build is in Part 2 under "Applying the patch and installing".
 | Built from source, unpatched | Builds and opens, crashes on every game launch. |
 | Built from source, first four patches | BotW boots, renders and plays; dies at random minutes in. |
 | Built from source, all six patches | Guard Malloc caught the writer; the crash-free retest at the reproducing setting is recorded in Part 4. |
-| Built from source, all patches (Fix 12 included) | Plays with no block artifact. Before and after: `macos/before.png`, `macos/after.png`. |
+| Built from source, all patches (Fix 12 included) | Plays with no block artifact. |
 | Installed at | `/Applications/suyu.app` |
+| Release | `v0.0.4a` on `github.com/kirbycope/suyu-v0.0.4`: a self-contained, ad-hoc signed `suyu.app` (Qt, FFmpeg, Boost, OpenSSL, SDL3, Vulkan loader, MoltenVK and its ICD manifest all inside the bundle) plus the patch |
 | Source tree | `~/GitHub/suyu` |
 
 ## Part 1 - why the prebuilt release cannot work
