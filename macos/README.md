@@ -202,19 +202,21 @@ Homebrew prefixes it `g` to avoid Apple's `/usr/bin/libtool`.
 
 There are two starting points.
 
-**From this repository.** The fixes are already in the tree; clone it, install the Homebrew
-packages listed above, run the same `cmake` configure, and build. Nothing to apply.
+**From this fork.** `github.com/kirbycope/suyu-v0.0.4`, branch `main`, already has every fix
+applied in the tree (one commit on top of upstream). Clone it, install the Homebrew packages
+listed above, run the same `cmake` configure, and build. Nothing to apply.
 
 **From upstream, with the patch file.** `suyu-macos-fixes.patch` is a plain `git diff` against
-commit `c0dd2ff` ("FINAL") of `github.com/suyu-emu/suyu-v0.0.4`, the tip of that repository at
-the time. It carries every fix in this document plus the inert diagnostics and was checked to
-apply cleanly to a fresh checkout of that commit. Whoever receives the file needs the upstream
-source at that commit, the patch, and `git`:
+commit `c0dd2ff` ("FINAL"), the tip of `suyu-emu/suyu-v0.0.4` at the time and the parent of the
+fork's commit. It carries every fix in this document plus the inert diagnostics and was checked
+to apply cleanly to a fresh checkout of that commit. The original repository is archived (still
+cloneable, read-only); the fork contains the same commit, so either source works. Whoever
+receives the file needs that commit checked out, the patch, and `git`:
 
 ```bash
-git clone --recurse-submodules --shallow-submodules https://github.com/suyu-emu/suyu-v0.0.4.git suyu
+git clone --recurse-submodules --shallow-submodules https://github.com/kirbycope/suyu-v0.0.4.git suyu
 cd suyu
-git checkout c0dd2ff                    # the commit the patch was made against
+git checkout c0dd2ff                    # upstream tip, the commit the patch was made against
 git apply --check /path/to/suyu-macos-fixes.patch   # dry run: prints nothing when it fits
 git apply /path/to/suyu-macos-fixes.patch
 ```
