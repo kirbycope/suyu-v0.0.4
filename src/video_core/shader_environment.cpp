@@ -399,6 +399,12 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
 }
 
+bool GraphicsEnvironment::IsTexturePixelFormatDepth(u32 handle) {
+    return VideoCore::Surface::GetFormatType(
+               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
+           VideoCore::Surface::SurfaceType::ColorTexture;
+}
+
 u32 GraphicsEnvironment::ReadViewportTransformState() {
     const auto& regs{maxwell3d->regs};
     viewport_transform_state = regs.viewport_scale_offset_enabled;
@@ -452,6 +458,12 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
 bool ComputeEnvironment::IsTexturePixelFormatInteger(u32 handle) {
     return VideoCore::Surface::IsPixelFormatInteger(
         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+}
+
+bool ComputeEnvironment::IsTexturePixelFormatDepth(u32 handle) {
+    return VideoCore::Surface::GetFormatType(
+               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
+           VideoCore::Surface::SurfaceType::ColorTexture;
 }
 
 u32 ComputeEnvironment::ReadViewportTransformState() {
@@ -560,6 +572,12 @@ Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
 bool FileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
     return VideoCore::Surface::IsPixelFormatInteger(
         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+}
+
+bool FileEnvironment::IsTexturePixelFormatDepth(u32 handle) {
+    return VideoCore::Surface::GetFormatType(
+               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
+           VideoCore::Surface::SurfaceType::ColorTexture;
 }
 
 u32 FileEnvironment::ReadViewportTransformState() {

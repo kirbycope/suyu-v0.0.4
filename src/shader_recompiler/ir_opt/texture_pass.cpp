@@ -812,11 +812,14 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             } else {
                 count = std::min(count, sampled_dynamic_cap);
                 const bool is_integer{is_texture_pixel_format_integer(cbuf)};
+                const bool is_depth_format{
+                    env.IsTexturePixelFormatDepth(GetTextureHandleCached(env, cbuf))};
                 index = descriptors.Add(TextureDescriptor{
                     .type = flags.type,
                     .is_depth = flags.is_depth != 0,
                     .is_multisample = is_multisample,
                     .is_integer = is_integer,
+                    .is_depth_format = is_depth_format,
                     .has_secondary = cbuf.has_secondary,
                     .cbuf_index = cbuf.index,
                     .cbuf_offset = cbuf.offset,

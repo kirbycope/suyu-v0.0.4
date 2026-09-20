@@ -13,6 +13,7 @@
 #include "common/common_types.h"
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_workarounds.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 
@@ -178,6 +179,21 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
 
     for (size_t i = 0; i < regs.rt.size(); ++i) {
         color_formats[i] = static_cast<u8>(regs.rt[i].format);
+    }
+    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
+        for (size_t i = 1; i < regs.rt.size(); ++i) {
+            const GPUVAddr address = regs.rt[i].Address();
+            if (address == 0 || regs.rt[i].format == Tegra::RenderTargetFormat::NONE) {
+                continue;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (regs.rt[j].Address() == address &&
+                    color_formats[j] != static_cast<u8>(Tegra::RenderTargetFormat::NONE)) {
+                    color_formats[i] = static_cast<u8>(Tegra::RenderTargetFormat::NONE);
+                    break;
+                }
+            }
+        }
     }
     alpha_test_ref = std::bit_cast<u32>(regs.alpha_test_ref);
     point_size = std::bit_cast<u32>(regs.point_size);

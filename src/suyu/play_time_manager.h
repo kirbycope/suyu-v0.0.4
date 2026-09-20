@@ -15,7 +15,7 @@ namespace Service::Account {
 class ProfileManager;
 }
 
-namespace PlayTime {
+namespace SuyuPlayTime {
 
 using ProgramId = u64;
 using PlayTime = u64;
@@ -48,4 +48,4 @@ private:
 
 QString ReadablePlayTime(qulonglong time_seconds);
 
-} // namespace PlayTime
+} // namespace SuyuPlayTime

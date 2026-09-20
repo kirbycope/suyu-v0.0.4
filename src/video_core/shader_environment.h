@@ -120,6 +120,8 @@ public:
 
     bool IsTexturePixelFormatInteger(u32 handle) override;
 
+    bool IsTexturePixelFormatDepth(u32 handle) override;
+
     u32 ReadViewportTransformState() override;
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
@@ -145,6 +147,8 @@ public:
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     bool IsTexturePixelFormatInteger(u32 handle) override;
+
+    bool IsTexturePixelFormatDepth(u32 handle) override;
 
     u32 ReadViewportTransformState() override;
 
@@ -179,6 +183,8 @@ public:
     [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     [[nodiscard]] bool IsTexturePixelFormatInteger(u32 handle) override;
+
+    [[nodiscard]] bool IsTexturePixelFormatDepth(u32 handle) override;
 
     [[nodiscard]] u32 ReadViewportTransformState() override;
 

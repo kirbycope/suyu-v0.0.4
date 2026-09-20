@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+
 #include <boost/container/static_vector.hpp>
 
 #include "common/settings.h"
@@ -320,6 +322,34 @@ Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_
     return ctx.OpINotEqual(ctx.U1, bit, ctx.u32_zero_value);
 }
 
+// Emulated depth comparison. The compare function comes from the guest sampler through the
+// compare_ops push constant words, 4 bits per texture.
+Id CompareOpBits(EmitContext& ctx, IR::TextureInstInfo info) {
+    const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
+    const Id member_index{ctx.Const(ctx.compare_ops_member_index)};
+    // Indexed like the rescaling bits: by texture descriptor, offset by the stage's base.
+    const u32 texture_index{info.descriptor_index + ctx.texture_rescaling_index};
+    const Id word_index{ctx.Const(texture_index / 8)};
+    const Id shift{ctx.Const((texture_index % 8) * 4)};
+    const Id pointer{ctx.OpAccessChain(push_constant_u32, ctx.rescaling_push_constants,
+                                       member_index, word_index)};
+    const Id word{ctx.OpLoad(ctx.U32[1], pointer)};
+    return ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], word, shift),
+                            ctx.Const(15u));
+}
+
+Id EmulatedCompare(EmitContext& ctx, Id op_bits, Id dref, Id depth) {
+    const auto bit{[&](u32 mask) {
+        return ctx.OpINotEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], op_bits, ctx.Const(mask)),
+                               ctx.u32_zero_value);
+    }};
+    const Id lt{ctx.OpLogicalAnd(ctx.U1, bit(1u), ctx.OpFOrdLessThan(ctx.U1, dref, depth))};
+    const Id eq{ctx.OpLogicalAnd(ctx.U1, bit(2u), ctx.OpFOrdEqual(ctx.U1, dref, depth))};
+    const Id gt{ctx.OpLogicalAnd(ctx.U1, bit(4u), ctx.OpFOrdGreaterThan(ctx.U1, dref, depth))};
+    const Id pass{ctx.OpLogicalOr(ctx.U1, ctx.OpLogicalOr(ctx.U1, lt, eq), gt)};
+    return ctx.OpSelect(ctx.F32[1], pass, ctx.Const(1.0f), ctx.Const(0.0f));
+}
+
 Id BitTest(EmitContext& ctx, Id mask, Id bit) {
     const Id shifted{ctx.OpShiftRightLogical(ctx.U32[1], mask, bit)};
     const Id bit_value{ctx.OpBitwiseAnd(ctx.U32[1], shifted, ctx.Const(1u))};
@@ -530,6 +560,25 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
                                   Id coords, Id dref, Id bias_lc, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
+        const Id op_bits{CompareOpBits(ctx, info)};
+        Id texel{};
+        if (ctx.stage == Stage::Fragment) {
+            const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
+                                         bias_lc, offset);
+            texel = Emit(&EmitContext::OpImageSparseSampleImplicitLod,
+                         &EmitContext::OpImageSampleImplicitLod, ctx, inst, ctx.F32[4],
+                         Texture(ctx, info, index), coords, operands.MaskOptional(),
+                         operands.Span());
+        } else {
+            const Id lod{ctx.Const(0.0f)};
+            const ImageOperands operands(ctx, false, true, false, lod, offset);
+            texel = Emit(&EmitContext::OpImageSparseSampleExplicitLod,
+                         &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
+                         Texture(ctx, info, index), coords, operands.Mask(), operands.Span());
+        }
+        return EmulatedCompare(ctx, op_bits, dref, ctx.OpCompositeExtract(ctx.F32[1], texel, 0u));
+    }
     if (ctx.stage == Stage::Fragment) {
         const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
                                      bias_lc, offset);
@@ -552,6 +601,13 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Va
                                   Id coords, Id dref, Id lod, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const ImageOperands operands(ctx, false, true, false, lod, offset);
+    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
+        const Id op_bits{CompareOpBits(ctx, info)};
+        const Id texel{Emit(&EmitContext::OpImageSparseSampleExplicitLod,
+                            &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
+                            Texture(ctx, info, index), coords, operands.Mask(), operands.Span())};
+        return EmulatedCompare(ctx, op_bits, dref, ctx.OpCompositeExtract(ctx.F32[1], texel, 0u));
+    }
     return Emit(&EmitContext::OpImageSparseSampleDrefExplicitLod,
                 &EmitContext::OpImageSampleDrefExplicitLod, ctx, inst, ctx.F32[1],
                 Texture(ctx, info, index), coords, dref, operands.Mask(), operands.Span());
@@ -581,6 +637,18 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
     const ImageOperands operands(ctx, offset, offset2);
     if (ctx.profile.need_gather_subpixel_offset) {
         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+    }
+    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
+        const Id op_bits{CompareOpBits(ctx, info)};
+        const Id texels{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx,
+                             inst, ctx.F32[4], Texture(ctx, info, index), coords, ctx.Const(0u),
+                             operands.MaskOptional(), operands.Span())};
+        std::array<Id, 4> lanes{};
+        for (u32 i = 0; i < 4; ++i) {
+            lanes[i] = EmulatedCompare(ctx, op_bits, dref,
+                                       ctx.OpCompositeExtract(ctx.F32[1], texels, i));
+        }
+        return ctx.OpCompositeConstruct(ctx.F32[4], lanes[0], lanes[1], lanes[2], lanes[3]);
     }
     const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
                         ctx, inst, result_type, Texture(ctx, info, index), coords, dref,

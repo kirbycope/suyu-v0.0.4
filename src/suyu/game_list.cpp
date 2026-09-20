@@ -349,12 +349,19 @@ void GameList::OnFilterCloseClicked() {
 }
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
-                   PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
+                   SuyuPlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
                    GMainWindow* parent)
     : QWidget{parent}, vfs{std::move(vfs_)}, provider{provider_},
       play_time_manager{play_time_manager_}, system{system_} {
     watcher = new QFileSystemWatcher(this);
-    connect(watcher, &QFileSystemWatcher::directoryChanged, this, &GameList::RefreshGameDirectory);
+    // A running game writes into the watched NAND and SDMC directories continuously, and each
+    // event used to rescan every game directory. Coalesce a burst of events into one reload.
+    refresh_timer = new QTimer(this);
+    refresh_timer->setSingleShot(true);
+    refresh_timer->setInterval(2000);
+    connect(refresh_timer, &QTimer::timeout, this, &GameList::RefreshGameDirectory);
+    connect(watcher, &QFileSystemWatcher::directoryChanged, this,
+            &GameList::OnWatchedDirectoryChanged);
 
     this->main_window = parent;
     layout = new QVBoxLayout;
@@ -1050,6 +1057,11 @@ void GameList::LoadInterfaceLayout() {
 const QStringList GameList::supported_file_extensions = {
     QStringLiteral("nso"), QStringLiteral("nro"), QStringLiteral("nca"),
     QStringLiteral("xci"), QStringLiteral("nsp"), QStringLiteral("kip")};
+
+void GameList::OnWatchedDirectoryChanged(const QString& path) {
+    LOG_DEBUG(Frontend, "Watched directory changed: {}", path.toStdString());
+    refresh_timer->start();
+}
 
 void GameList::RefreshGameDirectory() {
     if (!UISettings::values.game_dirs.empty()) {

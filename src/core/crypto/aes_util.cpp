@@ -128,11 +128,27 @@ void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op)
     if (size == 0)
         return;
 
-    // reset
-    ASSERT(EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1));
+    // A cipher constructed with an all-zero (absent) key is deliberately left uninitialised by
+    // the constructor. It is still called: with no cipher bound, EVP_CipherInit_ex fails and
+    // EVP_CIPHER_CTX_get_block_size returns 0, after which `size % 0` yields `size` on AArch64
+    // and the tail path memcpy's `size` bytes into a 16-byte stack buffer. Bail out before that.
+    if (EVP_CIPHER_CTX_get0_cipher(context) == nullptr ||
+        !EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARNING(Crypto, "Transcode called on a cipher with no usable key; output zeroed");
+        }
+        std::memset(dest, 0, size);
+        return;
+    }
 
     const int block_size = EVP_CIPHER_CTX_get_block_size(context);
-    ASSERT(block_size > 0 && block_size <= int(AesBlockBytes));
+    if (block_size <= 0 || block_size > int(AesBlockBytes)) {
+        LOG_ERROR(Crypto, "Invalid AES block size {}", block_size);
+        std::memset(dest, 0, size);
+        return;
+    }
 
     const std::size_t whole_block_bytes = size - (size % block_size);
     int written = 0;

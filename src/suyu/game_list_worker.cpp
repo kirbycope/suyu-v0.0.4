@@ -201,7 +201,7 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                                         const std::size_t size, const std::vector<u8>& icon,
                                         Loader::AppLoader& loader, u64 program_id,
                                         const CompatibilityList& compatibility_list,
-                                        const PlayTime::PlayTimeManager& play_time_manager,
+                                        const SuyuPlayTime::PlayTimeManager& play_time_manager,
                                         const FileSys::PatchManager& patch) {
     const auto it = FindMatchingCompatibilityEntry(compatibility_list, program_id);
 
@@ -237,7 +237,7 @@ GameListWorker::GameListWorker(FileSys::VirtualFilesystem vfs_,
                                FileSys::ManualContentProvider* provider_,
                                QVector<UISettings::GameDir>& game_dirs_,
                                const CompatibilityList& compatibility_list_,
-                               const PlayTime::PlayTimeManager& play_time_manager_,
+                               const SuyuPlayTime::PlayTimeManager& play_time_manager_,
                                Core::System& system_)
     : vfs{std::move(vfs_)}, provider{provider_}, game_dirs{game_dirs_},
       compatibility_list{compatibility_list_}, play_time_manager{play_time_manager_}, system{

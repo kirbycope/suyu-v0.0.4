@@ -6,12 +6,15 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -23,6 +26,7 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
+using Shader::Backend::SPIRV::NUM_TEXTURE_COMPARE_WORDS;
 
 [[nodiscard]] inline std::optional<PixelFormat> PixelFormatFromImageFormat(
     Shader::ImageFormat format) {
@@ -184,6 +188,18 @@ public:
             texture_bit = 1u;
             ++texture_ptr;
         }
+        ++texture_index;
+    }
+
+    /// Records the emulated depth compare bits of the texture PushTexture is about to push.
+    void PushTextureCompare(u32 compare_bits) noexcept {
+        if (texture_index < NUM_TEXTURE_COMPARE_WORDS * 8) {
+            compare_words[texture_index / 8] |= (compare_bits & 15u) << ((texture_index % 8) * 4);
+        }
+    }
+
+    const std::array<u32, NUM_TEXTURE_COMPARE_WORDS>& CompareData() const noexcept {
+        return compare_words;
     }
 
     void PushImage(bool is_rescaled) noexcept {
@@ -201,6 +217,8 @@ public:
 
 private:
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
+    std::array<u32, NUM_TEXTURE_COMPARE_WORDS> compare_words{};
+    u32 texture_index{};
     u32* texture_ptr{words.data()};
     u32* image_ptr{words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS};
     u32 texture_bit{1u};
@@ -217,13 +235,15 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 bool emulate_depth_compare) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
+        u32 compare_bits{};
         for (u32 index = 0; index < desc.count; ++index) {
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
@@ -234,6 +254,20 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             const Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+            // Diagnostic: is every sampled 1600x900 image one that has been rendered to?
+            if (image_view.size.width >= 1600 && image_view.size.height >= 900) {
+                ++g_large_sampled_total;
+                if (!IsKnownLargeRenderTarget(image_view.ImageHandle())) {
+                    if (const u64 n = ++g_large_sampled_not_rt; n % 500 == 1) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Sampled large image that was never a render target: {}x{} "
+                                 "format {} ({} so far of {})",
+                                 image_view.size.width, image_view.size.height,
+                                 static_cast<u32>(image_view.format), n,
+                                 g_large_sampled_total.load());
+                    }
+                }
+            }
             const bool use_fallback_sampler{sampler.HasAddedAnisotropy() &&
                                             !image_view.SupportsAnisotropy()};
             VkSampler vk_sampler{use_fallback_sampler ? sampler.HandleWithDefaultAnisotropy()
@@ -242,14 +276,33 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 VideoCore::Surface::IsPixelFormatInteger(image_view.format)) {
                 vk_sampler = sampler.HandleWithNearestFilter();
             }
-            if (desc.is_depth && sampler.HasDepthComparison() &&
-                !image_view.SupportsDepthComparison()) {
-                vk_sampler = sampler.HandleWithoutDepthComparison();
+            // Diagnostic: which depth-format images are read as plain (non-compare) textures.
+            if (!desc.is_depth && VideoCore::Surface::GetFormatType(image_view.format) !=
+                                      VideoCore::Surface::SurfaceType::ColorTexture) {
+                static std::atomic<u32> depth_as_color_reads{0};
+                if (const u32 n = ++depth_as_color_reads; n % 2000 == 1) {
+                    LOG_INFO(Render_Vulkan, "Depth-format image {} sampled as colour ({} so far)",
+                             static_cast<u32>(image_view.format), n);
+                }
+            }
+            if (desc.is_depth && sampler.HasDepthComparison()) {
+                if (emulate_depth_compare && !image_view.SupportsDepthComparison()) {
+                    // Colour-format texture compared against: the shader compares in code,
+                    // so hand it the guest compare function and sample the plain float
+                    // through a sampler without a compare op. Depth formats keep the native
+                    // hardware compare.
+                    compare_bits = sampler.DepthCompareFunc() |
+                                   (sampler.HasLinearFiltering() ? 8u : 0u);
+                    vk_sampler = sampler.HandleWithoutDepthComparison();
+                } else if (!image_view.SupportsDepthComparison()) {
+                    vk_sampler = sampler.HandleWithoutDepthComparison();
+                }
             }
             guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
+        rescaling.PushTextureCompare(compare_bits);
         rescaling.PushTexture(is_rescaled);
     }
     for (const auto& desc : info.image_descriptors) {

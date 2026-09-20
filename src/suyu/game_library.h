@@ -33,7 +33,7 @@ class ManualContentProvider;
 class VfsFilesystem;
 } // namespace FileSys
 
-namespace PlayTime {
+namespace SuyuPlayTime {
 class PlayTimeManager;
 }
 
@@ -62,7 +62,7 @@ class GameLibrary : public QWidget {
 public:
     explicit GameLibrary(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
                         FileSys::ManualContentProvider* provider_,
-                        PlayTime::PlayTimeManager& play_time_manager_,
+                        SuyuPlayTime::PlayTimeManager& play_time_manager_,
                         Core::System& system_,
                         GMainWindow* parent = nullptr);
     ~GameLibrary() override;
@@ -180,7 +180,7 @@ private:
     // Dependencies
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
-    PlayTime::PlayTimeManager& play_time_manager;
+    SuyuPlayTime::PlayTimeManager& play_time_manager;
     Core::System& system;
     GMainWindow* main_window;
     CompatibilityList compatibility_list;
@@ -199,7 +199,7 @@ class GameLibraryWorker : public QObject {
 public:
     explicit GameLibraryWorker(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
                               FileSys::ManualContentProvider* provider_,
-                              PlayTime::PlayTimeManager& play_time_manager_,
+                              SuyuPlayTime::PlayTimeManager& play_time_manager_,
                               Core::System& system_);
     ~GameLibraryWorker() override;
 
@@ -235,7 +235,7 @@ private:
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
-    PlayTime::PlayTimeManager& play_time_manager;
+    SuyuPlayTime::PlayTimeManager& play_time_manager;
     Core::System& system;
     CompatibilityList compatibility_list;
     std::atomic_bool stop_processing{false};

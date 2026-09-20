@@ -452,7 +452,7 @@ void RecordShaderReadBarrier(Scheduler& scheduler, const ImageView& image_view) 
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_SHADER_WRITE_BIT |
                              VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -467,8 +467,10 @@ void RecordShaderReadBarrier(Scheduler& scheduler, const ImageView& image_view) 
                 VK_PIPELINE_STAGE_TRANSFER_BIT |
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            // The destination image may next be sampled or bound as an attachment and loaded;
+            // limiting visibility to fragment/compute shaders left attachment loads racing this
+            // barrier (SYNC-HAZARD-READ-AFTER-WRITE at vkCmdBeginRenderPass).
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             0,
             barrier);
     });

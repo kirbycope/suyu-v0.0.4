@@ -96,7 +96,7 @@ namespace DiscordRPC {
 class DiscordInterface;
 }
 
-namespace PlayTime {
+namespace SuyuPlayTime {
 class PlayTimeManager;
 }
 
@@ -556,7 +556,7 @@ private:
 
     std::unique_ptr<Core::System> system;
     std::unique_ptr<DiscordRPC::DiscordInterface> discord_rpc;
-    std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
+    std::unique_ptr<SuyuPlayTime::PlayTimeManager> play_time_manager;
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
     MultiplayerState* multiplayer_state = nullptr;

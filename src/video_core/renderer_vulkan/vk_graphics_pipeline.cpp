@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <span>
 
@@ -43,6 +44,7 @@ using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
+using Shader::Backend::SPIRV::RESCALING_LAYOUT_COMPARE_OPS_OFFSET;
 using Tegra::Texture::TexturePair;
 using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::PixelFormatFromDepthFormat;
@@ -489,7 +491,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         buffer_cache.BindHostStageBuffers(stage);
         PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
-                             samplers_it, views_it);
+                             samplers_it, views_it, device.IsMoltenVK());
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
             render_area.uses_render_area = true;
@@ -526,6 +528,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
 void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
+    // Diagnostic: SUYU_SPLIT_EVERY_DRAW=1 ends the render pass before every draw, so each
+    // draw loads and stores its attachments through memory.
+    static const bool split_every_draw = std::getenv("SUYU_SPLIT_EVERY_DRAW") != nullptr;
+    if (split_every_draw) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -547,7 +555,7 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
 
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
     scheduler.Record([this, descriptor_data, bind_pipeline, rescaling_data = rescaling.Data(),
-                      is_rescaling, update_rescaling,
+                      compare_data = rescaling.CompareData(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_pipeline) {
@@ -556,6 +564,11 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                              rescaling_data.data());
+        if (device.IsMoltenVK()) {
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                                 RESCALING_LAYOUT_COMPARE_OPS_OFFSET, sizeof(compare_data),
+                                 compare_data.data());
+        }
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
@@ -833,8 +846,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        // Blending is ignored on integer attachments by Vulkan, but Metal refuses to build
+        // such a pipeline, so leave it off there explicitly.
+        const bool is_integer_attachment =
+            VideoCore::Surface::IsPixelFormatInteger(DecodeFormat(key.state.color_formats[index]));
         cb_attachments.push_back({
-            .blendEnable = blend.enable != 0,
+            .blendEnable = blend.enable != 0 && !is_integer_attachment,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
             .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
             .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),

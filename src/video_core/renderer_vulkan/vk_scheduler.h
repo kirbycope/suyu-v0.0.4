@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -28,6 +29,9 @@ class QueryCacheBase;
 
 namespace Vulkan {
 
+/// Diagnostic: 1 = flush the command buffer after every render pass, 2 = also wait for the GPU.
+extern std::atomic<int> g_debug_pass_sync;
+
 class CommandPool;
 class Device;
 class Framebuffer;
@@ -48,6 +52,9 @@ public:
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+
+    /// Diagnostic: see g_debug_pass_sync.
+    void DebugPassSync();
 
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
@@ -280,6 +287,7 @@ private:
     std::function<void()> on_submit;
 
     State state;
+    bool debug_pass_flush_pending = false;
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

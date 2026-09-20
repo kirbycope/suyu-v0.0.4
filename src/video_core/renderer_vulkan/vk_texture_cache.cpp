@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <unordered_set>
+#include <mutex>
+#include <cstdlib>
 #include <array>
 #include <optional>
 #include <span>
@@ -36,6 +39,23 @@
 #include "video_core/textures/decoders.h"
 
 namespace Vulkan {
+
+std::atomic<u64> g_large_images_created{0};
+std::atomic<u64> g_large_copies{0};
+std::atomic<u64> g_large_sampled_not_rt{0};
+std::atomic<u64> g_large_sampled_total{0};
+namespace {
+std::mutex g_large_rt_mutex;
+std::unordered_set<VkImage> g_large_rts;
+} // namespace
+void NoteLargeRenderTarget(VkImage image) {
+    std::scoped_lock lock{g_large_rt_mutex};
+    g_large_rts.insert(image);
+}
+bool IsKnownLargeRenderTarget(VkImage image) {
+    std::scoped_lock lock{g_large_rt_mutex};
+    return g_large_rts.contains(image);
+}
 
 using Tegra::Engines::Fermi2D;
 using Tegra::Texture::SwizzleSource;
@@ -160,7 +180,10 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         info.size.width == info.size.height && !device.HasBrokenCubeImageCompatibility()) {
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
-    if (info.type == ImageType::e3D) {
+    // Diagnostic: SUYU_NO_HEAP_FLAGS=1 drops the flag MoltenVK can only honour with MTLHeap,
+    // so the emulator can run with MVK_CONFIG_USE_MTLHEAP=0.
+    static const bool no_heap_flags = std::getenv("SUYU_NO_HEAP_FLAGS") != nullptr;
+    if (info.type == ImageType::e3D && !no_heap_flags) {
         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     }
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
@@ -626,18 +649,18 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
             .subresourceRange = subresource_range,
     };
 
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+    // The texture may still be read by vertex/fragment shaders of earlier draws; the narrow
+    // LATE_FRAGMENT_TESTS | COLOR_ATTACHMENT_OUTPUT | COMPUTE_SHADER scope omitted them.
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                            read_barrier);
     cmdbuf.CopyBufferToImage(src_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
     // TODO: Move this to another API
-    cmdbuf.PipelineBarrier(
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            0, nullptr, nullptr, write_barrier);
+    // The uploaded texels are sampled by vertex and fragment shaders. The previous destination
+    // scope (LATE_FRAGMENT_TESTS | COMPUTE_SHADER | COLOR_ATTACHMENT_OUTPUT) did not include those
+    // stages, so drivers that honour barrier scopes precisely (MoltenVK/Metal) could sample the
+    // texture before the copy's writes were visible, showing tile-sized blocks of stale data.
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                           nullptr, nullptr, write_barrier);
 }
 
 [[nodiscard]] VkImageBlit MakeImageBlit(const Region2D& dst_region, const Region2D& src_region,
@@ -996,6 +1019,10 @@ VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
 }
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
+    static std::atomic<u64> feedback_splits{0};
+    if (const u64 n = ++feedback_splits; n % 1000 == 1) {
+        LOG_INFO(Render_Vulkan, "Feedback loop render pass splits so far: {}", n);
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -1442,6 +1469,14 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
+    if (dst.info.size.width >= 1600 && dst.info.size.height >= 900) {
+        if (const u64 n = ++g_large_copies; n % 100 == 1) {
+            LOG_INFO(Render_Vulkan, "Large copy #{}: {}x{} fmt {} -> {}x{} fmt {} ({} regions)", n,
+                     src.info.size.width, src.info.size.height, static_cast<u32>(src.info.format),
+                     dst.info.size.width, dst.info.size.height, static_cast<u32>(dst.info.format),
+                     copies.size());
+        }
+    }
     // As per the size-compatible formats section of vulkan, copy manually via ReinterpretImage
     // these images that aren't size-compatible
     if (BytesPerBlock(src.info.format) != BytesPerBlock(dst.info.format)) {
@@ -1538,16 +1573,14 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
             },
         };
         cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0, nullptr, nullptr, pre_barriers);
         cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VideoCommon::FixSmallVectorADL(vk_copies));
         cmdbuf.PipelineBarrier(
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0, nullptr, nullptr, post_barriers);
     });
 }
@@ -1591,6 +1624,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    ? std::make_optional(VK_FORMAT_R32G32B32A32_SFLOAT)
                                    : std::nullopt)),
       aspect_mask(ImageAspectMask(info.format)) {
+    if (info.size.width >= 1600 && info.size.height >= 900) {
+        if (const u64 n = ++g_large_images_created; n % 25 == 1) {
+            LOG_INFO(Render_Vulkan, "Large image #{} created: {}x{} format {} type {}", n,
+                     info.size.width, info.size.height, static_cast<u32>(info.format),
+                     static_cast<u32>(info.type));
+        }
+    }
     if (IsPixelFormatASTC(info.format) && !runtime->device.IsOptimalAstcSupported()) {
         switch (Settings::values.accelerate_astc.GetValue()) {
         case Settings::AstcDecodeMode::Gpu:
@@ -2338,6 +2378,16 @@ vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_
             break;
         }
     }
+    // Diagnostic (SUYU_NO_HEAP_FLAGS=1): without MTLHeap, MoltenVK cannot view a 3D texture as
+    // 2D or 2D array; fall back to a 3D view so the run survives (that texture samples wrong).
+    static const bool no_heap_flags = std::getenv("SUYU_NO_HEAP_FLAGS") != nullptr;
+    if (no_heap_flags && slot_images != nullptr &&
+        (*slot_images)[image_id].info.type == ImageType::e3D &&
+        (view_type == VK_IMAGE_VIEW_TYPE_2D || view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY)) {
+        view_type = VK_IMAGE_VIEW_TYPE_3D;
+        subresource_range.baseArrayLayer = 0;
+        subresource_range.layerCount = 1;
+    }
     return device->GetLogical().CreateImageView({
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = nullptr,
@@ -2440,6 +2490,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     }
     if (tsc.depth_compare_enabled) {
         sampler_noncompare = create_sampler(max_anisotropy, false, true);
+        depth_compare_func = static_cast<u32>(tsc.depth_compare_func.Value());
     }
 }
 
@@ -2450,6 +2501,13 @@ Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM
           .height = key.size.height,
       }} {
     CreateFramebuffer(runtime, color_buffers, depth_buffer, key.is_rescaled);
+    // Diagnostic: one line per unique render target set, to see what the guest renders into.
+    LOG_INFO(Render_Vulkan, "Framebuffer {}", VideoCommon::Name(key));
+    if (key.size.width >= 1600 && key.size.height >= 900) {
+        for (u32 i = 0; i < num_images; ++i) {
+            NoteLargeRenderTarget(images[i]);
+        }
+    }
     if (runtime.device.HasDebuggingToolAttached()) {
         framebuffer.SetObjectNameEXT(VideoCommon::Name(key).c_str());
     }

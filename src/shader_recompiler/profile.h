@@ -95,6 +95,9 @@ struct Profile {
 
     /// Maxwell and earlier nVidia architectures have broken robust support
     bool has_broken_robust{};
+    /// Depth comparison sampling is done in the shader instead of the sampler. Metal only
+    /// compares against depth-format textures, and guests sample colour formats with compare.
+    bool emulate_depth_compare{};
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};

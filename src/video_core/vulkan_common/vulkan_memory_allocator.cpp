@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <limits>
 #include <optional>
@@ -304,6 +305,12 @@ namespace Vulkan {
         const auto vma_usage = MemoryUsageVma(usage);
         VmaAllocationCreateInfo ci{};
         ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
+        // Diagnostic: SUYU_DEDICATED_IMAGES=1 gives every image its own VkDeviceMemory, so no
+        // two images share a MoltenVK heap.
+        static const bool dedicated_images = std::getenv("SUYU_DEDICATED_IMAGES") != nullptr;
+        if (dedicated_images) {
+            ci.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        }
         ci.usage = vma_usage;
         ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
         ci.requiredFlags = 0;

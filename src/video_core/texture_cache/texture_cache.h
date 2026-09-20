@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <limits>
 #include <optional>
 #include <bit>
@@ -22,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/gpu_workarounds.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/decoders.h"
@@ -260,36 +263,27 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     const u32 depth_bit = 1u << NUM_RT;
     const bool depth_active = (rt_active_mask & depth_bit) != 0;
 
+    // Any sampled view of an image that is also a bound colour or depth attachment is a
+    // feedback loop. Upstream yuzu splits the render pass for every such case; this fork had
+    // narrowed it to a *different* view of the depth image only. On a tile-based GPU (Apple,
+    // via MoltenVK) reading the attachment being rendered returns whatever each tile last
+    // flushed to memory, which shows up as a screen-aligned grid of stale tiles, so the full
+    // check is restored.
     const bool requires_barrier = [&] {
         for (const auto& view : views) {
             if (!view.id) {
                 continue;
             }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
-            }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
-                continue;
-
             const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
+            for (size_t i = 0; i < NUM_RT; ++i) {
+                if ((rt_active_mask & (1u << i)) != 0 && view_image_id == rt_image_id[i]) {
+                    return true;
+                }
             }
             if (depth_active && view_image_id == rt_depth_image_id) {
                 return true;
             }
         }
-
         return false;
     }();
 
@@ -1074,6 +1068,15 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
                                               size_t buffer_offset,
                                               std::span<const VideoCommon::BufferImageCopy> copies,
                                               GPUVAddr address, size_t size) {
+    // Diagnostic: a render-target sized image being downloaded to guest memory.
+    if (image->info.size.width >= 1600 && image->info.size.height >= 900) {
+        static std::atomic<u64> large_downloads{0};
+        if (const u64 n = ++large_downloads; n % 20 == 1) {
+            LOG_INFO(HW_GPU, "Large image downloaded to guest memory: {}x{} format {} gpu_addr {:#x} ({} so far)",
+                     image->info.size.width, image->info.size.height,
+                     static_cast<u32>(image->info.format), image->gpu_addr, n);
+        }
+    }
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         const BufferDownload new_buffer_download{address, size};
         auto slot = slot_buffer_downloads.insert(new_buffer_download);
@@ -1102,6 +1105,18 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
 
+    // Diagnostic: a render-target sized image being re-uploaded from guest memory.
+    if (image.info.size.width >= 1600 && image.info.size.height >= 900) {
+        static std::atomic<u64> large_refreshes{0};
+        if (const u64 n = ++large_refreshes; n % 20 == 1) {
+            LOG_INFO(HW_GPU,
+                     "Large image refreshed from guest memory: {}x{} format {} gpu_addr {:#x} "
+                     "gpu_modified {} ({} so far)",
+                     image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), image.gpu_addr,
+                     True(image.flags & ImageFlagBits::GpuModified), n);
+        }
+    }
     image.flags &= ~ImageFlagBits::CpuModified;
 
     TrackImage(image, image_id);
@@ -1951,6 +1966,14 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
     }
     if (rt.format == Tegra::RenderTargetFormat::NONE) {
         return ImageViewId{};
+    }
+    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
+        for (size_t j = 0; j < index; ++j) {
+            if (regs.rt[j].Address() == gpu_addr &&
+                regs.rt[j].format != Tegra::RenderTargetFormat::NONE) {
+                return ImageViewId{};
+            }
+        }
     }
     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
     return FindRenderTargetView(info, gpu_addr);

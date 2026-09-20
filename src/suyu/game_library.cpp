@@ -46,7 +46,7 @@
 
 GameLibrary::GameLibrary(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
                         FileSys::ManualContentProvider* provider_,
-                        PlayTime::PlayTimeManager& play_time_manager_,
+                        SuyuPlayTime::PlayTimeManager& play_time_manager_,
                         Core::System& system_,
                         GMainWindow* parent)
     : QWidget(parent), main_layout(nullptr), toolbar_layout(nullptr), search_bar(nullptr),
@@ -602,7 +602,7 @@ void GameLibrary::AddPermDirPopup(QMenu& context_menu, QModelIndex selected) {
 // GameLibraryWorker implementation
 GameLibraryWorker::GameLibraryWorker(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
                                     FileSys::ManualContentProvider* provider_,
-                                    PlayTime::PlayTimeManager& play_time_manager_,
+                                    SuyuPlayTime::PlayTimeManager& play_time_manager_,
                                     Core::System& system_)
     : vfs(std::move(vfs_)), provider(provider_), play_time_manager(play_time_manager_),
       system(system_) {

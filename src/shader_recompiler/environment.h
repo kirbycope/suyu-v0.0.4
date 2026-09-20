@@ -82,6 +82,8 @@ public:
 
     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
 
+    [[nodiscard]] virtual bool IsTexturePixelFormatDepth(u32 raw_handle) = 0;
+
     [[nodiscard]] virtual u32 ReadViewportTransformState() = 0;
 
     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;

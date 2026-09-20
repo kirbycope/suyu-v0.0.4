@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <functional>
+#include <atomic>
 #include <thread>
 
 #include <ranges>
@@ -69,6 +71,18 @@ void MasterSemaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         counter = semaphore.GetCounter();
+        // The GPU can never be ahead of the host: the highest value ever signalled is
+        // current_tick - 1. A driver that reports more (seen with MoltenVK) would make every
+        // IsFree() check pass and let command buffers, descriptor sets and staging memory be
+        // recycled while the GPU is still using them. Clamp and shout.
+        if (const u64 host_max = current_tick.load(std::memory_order_acquire) - 1; counter > host_max) {
+            static std::atomic<u32> reports{0};
+            if (reports.fetch_add(1) < 20) {
+                LOG_ERROR(Render_Vulkan, "Timeline semaphore counter {} is ahead of host tick {} - clamping",
+                          counter, host_max);
+            }
+            counter = host_max;
+        }
         if (counter < this_tick) {
             return;
         }

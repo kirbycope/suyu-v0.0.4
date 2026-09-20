@@ -12,6 +12,7 @@
 #include <QList>
 #include <QStandardItemModel>
 #include <QString>
+#include <QTimer>
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QVector>
@@ -86,7 +87,7 @@ public:
 
     explicit GameList(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
                       FileSys::ManualContentProvider* provider_,
-                      PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
+                      SuyuPlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
                       GMainWindow* parent = nullptr);
     ~GameList() override;
 
@@ -162,6 +163,7 @@ private:
 private:
     void ValidateEntry(const QModelIndex& item);
 
+    void OnWatchedDirectoryChanged(const QString& path);
     void RefreshGameDirectory();
 
     void ToggleFavorite(u64 program_id);
@@ -187,12 +189,13 @@ private:
     QStandardItemModel* item_model = nullptr;
     std::unique_ptr<GameListWorker> current_worker;
     QFileSystemWatcher* watcher = nullptr;
+    QTimer* refresh_timer = nullptr;
     ControllerNavigation* controller_navigation = nullptr;
     CompatibilityList compatibility_list;
 
     friend class GameListSearchField;
 
-    const PlayTime::PlayTimeManager& play_time_manager;
+    const SuyuPlayTime::PlayTimeManager& play_time_manager;
     Core::System& system;
 };
 

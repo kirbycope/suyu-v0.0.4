@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <climits>
@@ -31,7 +32,10 @@ enum class Operation {
 Id ImageType(EmitContext& ctx, const TextureDescriptor& desc) {
     const spv::ImageFormat format{spv::ImageFormat::Unknown};
     const Id type{desc.is_integer ? ctx.U32[1] : ctx.F32[1]};
-    const bool depth{desc.is_depth};
+    // Metal reads a depth-format texture correctly only through a depth image type, and can
+    // only hardware-compare against one, so on MoltenVK the image type follows the bound
+    // texture's format rather than whether the shader compares against it.
+    const bool depth{ctx.profile.emulate_depth_compare ? desc.is_depth_format : desc.is_depth};
     const bool ms{desc.is_multisample};
     switch (desc.type) {
     case TextureType::Color1D:
@@ -1016,7 +1020,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
-    if (!info.uses_rescaling_uniform) {
+    const bool needs_compare_ops{
+        profile.emulate_depth_compare &&
+        std::ranges::any_of(info.texture_descriptors, [](const auto& desc) { return desc.is_depth; })};
+    if (!info.uses_rescaling_uniform && !needs_compare_ops) {
         return;
     }
     if (profile.unified_descriptor_binding) {
@@ -1027,7 +1034,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1039,6 +1046,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
     Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
     members.push_back(rescaling_images_type);
     rescaling_images_member_index = member_index++;
+
+    compare_ops_type = TypeArray(U32[1], Const(NUM_TEXTURE_COMPARE_WORDS));
+    Decorate(compare_ops_type, spv::Decoration::ArrayStride, 4u);
+    members.push_back(compare_ops_type);
+    compare_ops_member_index = member_index++;
 
     if (stage != Stage::Compute) {
         members.push_back(F32[1]);
@@ -1055,6 +1067,10 @@ void EmitContext::DefineRescalingInputPushConstant() {
     MemberDecorate(push_constant_struct, rescaling_images_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
     MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
+
+    MemberDecorate(push_constant_struct, compare_ops_member_index, spv::Decoration::Offset,
+                   static_cast<u32>(offsetof(RescalingLayout, compare_ops)));
+    MemberName(push_constant_struct, compare_ops_member_index, "compare_ops");
 
     if (stage != Stage::Compute) {
         MemberDecorate(push_constant_struct, rescaling_downfactor_member_index,
@@ -1386,6 +1402,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             .count = desc.count,
             .is_multisample = desc.is_multisample,
             .is_integer = desc.is_integer,
+            .is_depth_image = profile.emulate_depth_compare ? desc.is_depth_format : desc.is_depth,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
@@ -1614,6 +1631,11 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        // Experiment (SUYU_INVARIANT=1): a depth pre-pass and a later pass must produce identical
+        // positions or an EQUAL depth test fails; Metal does not guarantee that without invariance.
+        if (static const bool invariant = std::getenv("SUYU_INVARIANT") != nullptr; invariant) {
+            Decorate(output_position, spv::Decoration::Invariant);
+        }
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {

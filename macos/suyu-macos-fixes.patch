@@ -1,0 +1,2396 @@
+diff --git a/src/core/crypto/aes_util.cpp b/src/core/crypto/aes_util.cpp
+index bd8c97e..bda3942 100644
+--- a/src/core/crypto/aes_util.cpp
++++ b/src/core/crypto/aes_util.cpp
+@@ -128,11 +128,27 @@ void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op)
+     if (size == 0)
+         return;
+ 
+-    // reset
+-    ASSERT(EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1));
++    // A cipher constructed with an all-zero (absent) key is deliberately left uninitialised by
++    // the constructor. It is still called: with no cipher bound, EVP_CipherInit_ex fails and
++    // EVP_CIPHER_CTX_get_block_size returns 0, after which `size % 0` yields `size` on AArch64
++    // and the tail path memcpy's `size` bytes into a 16-byte stack buffer. Bail out before that.
++    if (EVP_CIPHER_CTX_get0_cipher(context) == nullptr ||
++        !EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1)) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            LOG_WARNING(Crypto, "Transcode called on a cipher with no usable key; output zeroed");
++        }
++        std::memset(dest, 0, size);
++        return;
++    }
+ 
+     const int block_size = EVP_CIPHER_CTX_get_block_size(context);
+-    ASSERT(block_size > 0 && block_size <= int(AesBlockBytes));
++    if (block_size <= 0 || block_size > int(AesBlockBytes)) {
++        LOG_ERROR(Crypto, "Invalid AES block size {}", block_size);
++        std::memset(dest, 0, size);
++        return;
++    }
+ 
+     const std::size_t whole_block_bytes = size - (size % block_size);
+     int written = 0;
+diff --git a/src/core/file_sys/system_archive/system_archive.cpp b/src/core/file_sys/system_archive/system_archive.cpp
+index bb6326c..a71b40f 100644
+--- a/src/core/file_sys/system_archive/system_archive.cpp
++++ b/src/core/file_sys/system_archive/system_archive.cpp
+@@ -76,6 +76,13 @@ constexpr inline SystemArchiveDescriptor GetSystemArchive(u64 title_id) {
+ 
+ VirtualFile SynthesizeSystemArchive(const u64 title_id) {
+     auto const desc = GetSystemArchive(title_id);
++    if (desc.name == nullptr) {
++        // fmt throws format_error on a null const char*, and an exception escaping the FS
++        // service thread aborts the process. Report the unknown archive and let the caller
++        // return "target not found" to the guest instead.
++        LOG_WARNING(Service_FS, "Unknown system archive requested (0x{:016X}).", title_id);
++        return nullptr;
++    }
+     LOG_INFO(Service_FS, "Synthesizing system archive '{}' (0x{:016X}).", desc.name, title_id);
+     if (desc.supplier != nullptr) {
+         if (auto const dir = desc.supplier(); dir != nullptr) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.h b/src/shader_recompiler/backend/spirv/emit_spirv.h
+index 04cba65..cfb520f 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.h
+@@ -21,9 +21,13 @@ constexpr u32 NUM_IMAGE_SCALING_WORDS = 2;
+ constexpr u32 NUM_TEXTURE_AND_IMAGE_SCALING_WORDS =
+     NUM_TEXTURE_SCALING_WORDS + NUM_IMAGE_SCALING_WORDS;
+ 
++/// Emulated depth comparison: 4 bits per texture, bits 0-2 the Maxwell DepthCompareFunc
++/// (bit 0 less, bit 1 equal, bit 2 greater), bit 3 set when the sampler filters linearly.
++constexpr u32 NUM_TEXTURE_COMPARE_WORDS = 16;
+ struct RescalingLayout {
+     alignas(16) std::array<u32, NUM_TEXTURE_SCALING_WORDS> rescaling_textures;
+     alignas(16) std::array<u32, NUM_IMAGE_SCALING_WORDS> rescaling_images;
++    alignas(16) std::array<u32, NUM_TEXTURE_COMPARE_WORDS> compare_ops;
+     u32 down_factor;
+ };
+ struct RenderAreaLayout {
+@@ -31,6 +35,7 @@ struct RenderAreaLayout {
+ };
+ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
+ constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
++constexpr u32 RESCALING_LAYOUT_COMPARE_OPS_OFFSET = offsetof(RescalingLayout, compare_ops);
+ constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+ 
+ [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+index 50d45db..947864e 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <array>
++
+ #include <boost/container/static_vector.hpp>
+ 
+ #include "common/settings.h"
+@@ -320,6 +322,34 @@ Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_
+     return ctx.OpINotEqual(ctx.U1, bit, ctx.u32_zero_value);
+ }
+ 
++// Emulated depth comparison. The compare function comes from the guest sampler through the
++// compare_ops push constant words, 4 bits per texture.
++Id CompareOpBits(EmitContext& ctx, IR::TextureInstInfo info) {
++    const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
++    const Id member_index{ctx.Const(ctx.compare_ops_member_index)};
++    // Indexed like the rescaling bits: by texture descriptor, offset by the stage's base.
++    const u32 texture_index{info.descriptor_index + ctx.texture_rescaling_index};
++    const Id word_index{ctx.Const(texture_index / 8)};
++    const Id shift{ctx.Const((texture_index % 8) * 4)};
++    const Id pointer{ctx.OpAccessChain(push_constant_u32, ctx.rescaling_push_constants,
++                                       member_index, word_index)};
++    const Id word{ctx.OpLoad(ctx.U32[1], pointer)};
++    return ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], word, shift),
++                            ctx.Const(15u));
++}
++
++Id EmulatedCompare(EmitContext& ctx, Id op_bits, Id dref, Id depth) {
++    const auto bit{[&](u32 mask) {
++        return ctx.OpINotEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], op_bits, ctx.Const(mask)),
++                               ctx.u32_zero_value);
++    }};
++    const Id lt{ctx.OpLogicalAnd(ctx.U1, bit(1u), ctx.OpFOrdLessThan(ctx.U1, dref, depth))};
++    const Id eq{ctx.OpLogicalAnd(ctx.U1, bit(2u), ctx.OpFOrdEqual(ctx.U1, dref, depth))};
++    const Id gt{ctx.OpLogicalAnd(ctx.U1, bit(4u), ctx.OpFOrdGreaterThan(ctx.U1, dref, depth))};
++    const Id pass{ctx.OpLogicalOr(ctx.U1, ctx.OpLogicalOr(ctx.U1, lt, eq), gt)};
++    return ctx.OpSelect(ctx.F32[1], pass, ctx.Const(1.0f), ctx.Const(0.0f));
++}
++
+ Id BitTest(EmitContext& ctx, Id mask, Id bit) {
+     const Id shifted{ctx.OpShiftRightLogical(ctx.U32[1], mask, bit)};
+     const Id bit_value{ctx.OpBitwiseAnd(ctx.U32[1], shifted, ctx.Const(1u))};
+@@ -530,6 +560,25 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
+ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
+                                   Id coords, Id dref, Id bias_lc, const IR::Value& offset) {
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
++    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
++        const Id op_bits{CompareOpBits(ctx, info)};
++        Id texel{};
++        if (ctx.stage == Stage::Fragment) {
++            const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
++                                         bias_lc, offset);
++            texel = Emit(&EmitContext::OpImageSparseSampleImplicitLod,
++                         &EmitContext::OpImageSampleImplicitLod, ctx, inst, ctx.F32[4],
++                         Texture(ctx, info, index), coords, operands.MaskOptional(),
++                         operands.Span());
++        } else {
++            const Id lod{ctx.Const(0.0f)};
++            const ImageOperands operands(ctx, false, true, false, lod, offset);
++            texel = Emit(&EmitContext::OpImageSparseSampleExplicitLod,
++                         &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
++                         Texture(ctx, info, index), coords, operands.Mask(), operands.Span());
++        }
++        return EmulatedCompare(ctx, op_bits, dref, ctx.OpCompositeExtract(ctx.F32[1], texel, 0u));
++    }
+     if (ctx.stage == Stage::Fragment) {
+         const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
+                                      bias_lc, offset);
+@@ -552,6 +601,13 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Va
+                                   Id coords, Id dref, Id lod, const IR::Value& offset) {
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
+     const ImageOperands operands(ctx, false, true, false, lod, offset);
++    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
++        const Id op_bits{CompareOpBits(ctx, info)};
++        const Id texel{Emit(&EmitContext::OpImageSparseSampleExplicitLod,
++                            &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
++                            Texture(ctx, info, index), coords, operands.Mask(), operands.Span())};
++        return EmulatedCompare(ctx, op_bits, dref, ctx.OpCompositeExtract(ctx.F32[1], texel, 0u));
++    }
+     return Emit(&EmitContext::OpImageSparseSampleDrefExplicitLod,
+                 &EmitContext::OpImageSampleDrefExplicitLod, ctx, inst, ctx.F32[1],
+                 Texture(ctx, info, index), coords, dref, operands.Mask(), operands.Span());
+@@ -582,6 +638,18 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
+     if (ctx.profile.need_gather_subpixel_offset) {
+         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+     }
++    if (ctx.profile.emulate_depth_compare && !ctx.textures.at(info.descriptor_index).is_depth_image) {
++        const Id op_bits{CompareOpBits(ctx, info)};
++        const Id texels{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx,
++                             inst, ctx.F32[4], Texture(ctx, info, index), coords, ctx.Const(0u),
++                             operands.MaskOptional(), operands.Span())};
++        std::array<Id, 4> lanes{};
++        for (u32 i = 0; i < 4; ++i) {
++            lanes[i] = EmulatedCompare(ctx, op_bits, dref,
++                                       ctx.OpCompositeExtract(ctx.F32[1], texels, i));
++        }
++        return ctx.OpCompositeConstruct(ctx.F32[4], lanes[0], lanes[1], lanes[2], lanes[3]);
++    }
+     const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
+                         ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
+                         operands.MaskOptional(), operands.Span())};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 79a4549..a17ec17 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <array>
+ #include <bit>
+ #include <climits>
+@@ -31,7 +32,10 @@ enum class Operation {
+ Id ImageType(EmitContext& ctx, const TextureDescriptor& desc) {
+     const spv::ImageFormat format{spv::ImageFormat::Unknown};
+     const Id type{desc.is_integer ? ctx.U32[1] : ctx.F32[1]};
+-    const bool depth{desc.is_depth};
++    // Metal reads a depth-format texture correctly only through a depth image type, and can
++    // only hardware-compare against one, so on MoltenVK the image type follows the bound
++    // texture's format rather than whether the shader compares against it.
++    const bool depth{ctx.profile.emulate_depth_compare ? desc.is_depth_format : desc.is_depth};
+     const bool ms{desc.is_multisample};
+     switch (desc.type) {
+     case TextureType::Color1D:
+@@ -1016,7 +1020,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+ }
+ 
+ void EmitContext::DefineRescalingInput(const Info& info) {
+-    if (!info.uses_rescaling_uniform) {
++    const bool needs_compare_ops{
++        profile.emulate_depth_compare &&
++        std::ranges::any_of(info.texture_descriptors, [](const auto& desc) { return desc.is_depth; })};
++    if (!info.uses_rescaling_uniform && !needs_compare_ops) {
+         return;
+     }
+     if (profile.unified_descriptor_binding) {
+@@ -1027,7 +1034,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
+ }
+ 
+ void EmitContext::DefineRescalingInputPushConstant() {
+-    boost::container::static_vector<Id, 3> members{};
++    boost::container::static_vector<Id, 4> members{};
+     u32 member_index{0};
+ 
+     rescaling_textures_type = TypeArray(U32[1], Const(4u));
+@@ -1040,6 +1047,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
+     members.push_back(rescaling_images_type);
+     rescaling_images_member_index = member_index++;
+ 
++    compare_ops_type = TypeArray(U32[1], Const(NUM_TEXTURE_COMPARE_WORDS));
++    Decorate(compare_ops_type, spv::Decoration::ArrayStride, 4u);
++    members.push_back(compare_ops_type);
++    compare_ops_member_index = member_index++;
++
+     if (stage != Stage::Compute) {
+         members.push_back(F32[1]);
+         rescaling_downfactor_member_index = member_index++;
+@@ -1056,6 +1068,10 @@ void EmitContext::DefineRescalingInputPushConstant() {
+                    static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
+     MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
+ 
++    MemberDecorate(push_constant_struct, compare_ops_member_index, spv::Decoration::Offset,
++                   static_cast<u32>(offsetof(RescalingLayout, compare_ops)));
++    MemberName(push_constant_struct, compare_ops_member_index, "compare_ops");
++
+     if (stage != Stage::Compute) {
+         MemberDecorate(push_constant_struct, rescaling_downfactor_member_index,
+                        spv::Decoration::Offset,
+@@ -1386,6 +1402,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
+             .count = desc.count,
+             .is_multisample = desc.is_multisample,
+             .is_integer = desc.is_integer,
++            .is_depth_image = profile.emulate_depth_compare ? desc.is_depth_format : desc.is_depth,
+         });
+         if (profile.supported_spirv >= 0x00010400) {
+             interfaces.push_back(id);
+@@ -1614,6 +1631,11 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
+     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
+         stage == Stage::VertexB) {
+         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
++        // Experiment (SUYU_INVARIANT=1): a depth pre-pass and a later pass must produce identical
++        // positions or an EQUAL depth test fails; Metal does not guarantee that without invariance.
++        if (static const bool invariant = std::getenv("SUYU_INVARIANT") != nullptr; invariant) {
++            Decorate(output_position, spv::Decoration::Invariant);
++        }
+     }
+     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
+         if (stage == Stage::Fragment) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 260690b..60c5cc8 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -43,6 +43,7 @@ struct TextureDefinition {
+     u32 count;
+     bool is_multisample;
+     bool is_integer;
++    bool is_depth_image;
+ };
+ 
+ struct TextureBufferDefinition {
+@@ -303,6 +304,8 @@ public:
+     u32 rescaling_textures_member_index{};
+     u32 rescaling_images_member_index{};
+     u32 rescaling_downfactor_member_index{};
++    Id compare_ops_type{};
++    u32 compare_ops_member_index{};
+     u32 texture_rescaling_index{};
+     u32 image_rescaling_index{};
+ 
+diff --git a/src/shader_recompiler/environment.h b/src/shader_recompiler/environment.h
+index 84962de..1ce50c8 100644
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -82,6 +82,8 @@ public:
+ 
+     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
+ 
++    [[nodiscard]] virtual bool IsTexturePixelFormatDepth(u32 raw_handle) = 0;
++
+     [[nodiscard]] virtual u32 ReadViewportTransformState() = 0;
+ 
+     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+index b766f00..24f22f6 100644
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -812,11 +812,14 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+             } else {
+                 count = std::min(count, sampled_dynamic_cap);
+                 const bool is_integer{is_texture_pixel_format_integer(cbuf)};
++                const bool is_depth_format{
++                    env.IsTexturePixelFormatDepth(GetTextureHandleCached(env, cbuf))};
+                 index = descriptors.Add(TextureDescriptor{
+                     .type = flags.type,
+                     .is_depth = flags.is_depth != 0,
+                     .is_multisample = is_multisample,
+                     .is_integer = is_integer,
++                    .is_depth_format = is_depth_format,
+                     .has_secondary = cbuf.has_secondary,
+                     .cbuf_index = cbuf.index,
+                     .cbuf_offset = cbuf.offset,
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index f417d94..a878d90 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -95,6 +95,9 @@ struct Profile {
+ 
+     /// Maxwell and earlier nVidia architectures have broken robust support
+     bool has_broken_robust{};
++    /// Depth comparison sampling is done in the shader instead of the sampler. Metal only
++    /// compares against depth-format textures, and guests sample colour formats with compare.
++    bool emulate_depth_compare{};
+ 
+     u64 min_ssbo_alignment{};
+     u32 max_user_clip_distances{};
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index e0de786..5e7e26f 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -210,6 +210,7 @@ struct TextureDescriptor {
+     bool is_depth;
+     bool is_multisample;
+     bool is_integer;
++    bool is_depth_format; ///< The bound guest texture has a depth format
+     bool has_secondary;
+     u32 cbuf_index;
+     u32 cbuf_offset;
+diff --git a/src/suyu/game_library.cpp b/src/suyu/game_library.cpp
+index 2f2b490..1741baf 100644
+--- a/src/suyu/game_library.cpp
++++ b/src/suyu/game_library.cpp
+@@ -46,7 +46,7 @@
+ 
+ GameLibrary::GameLibrary(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
+                         FileSys::ManualContentProvider* provider_,
+-                        PlayTime::PlayTimeManager& play_time_manager_,
++                        SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                         Core::System& system_,
+                         GMainWindow* parent)
+     : QWidget(parent), main_layout(nullptr), toolbar_layout(nullptr), search_bar(nullptr),
+@@ -602,7 +602,7 @@ void GameLibrary::AddPermDirPopup(QMenu& context_menu, QModelIndex selected) {
+ // GameLibraryWorker implementation
+ GameLibraryWorker::GameLibraryWorker(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
+                                     FileSys::ManualContentProvider* provider_,
+-                                    PlayTime::PlayTimeManager& play_time_manager_,
++                                    SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                                     Core::System& system_)
+     : vfs(std::move(vfs_)), provider(provider_), play_time_manager(play_time_manager_),
+       system(system_) {
+diff --git a/src/suyu/game_library.h b/src/suyu/game_library.h
+index e8d00ab..5a95c6d 100644
+--- a/src/suyu/game_library.h
++++ b/src/suyu/game_library.h
+@@ -33,7 +33,7 @@ class ManualContentProvider;
+ class VfsFilesystem;
+ } // namespace FileSys
+ 
+-namespace PlayTime {
++namespace SuyuPlayTime {
+ class PlayTimeManager;
+ }
+ 
+@@ -62,7 +62,7 @@ class GameLibrary : public QWidget {
+ public:
+     explicit GameLibrary(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
+                         FileSys::ManualContentProvider* provider_,
+-                        PlayTime::PlayTimeManager& play_time_manager_,
++                        SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                         Core::System& system_,
+                         GMainWindow* parent = nullptr);
+     ~GameLibrary() override;
+@@ -180,7 +180,7 @@ private:
+     // Dependencies
+     std::shared_ptr<FileSys::VfsFilesystem> vfs;
+     FileSys::ManualContentProvider* provider;
+-    PlayTime::PlayTimeManager& play_time_manager;
++    SuyuPlayTime::PlayTimeManager& play_time_manager;
+     Core::System& system;
+     GMainWindow* main_window;
+     CompatibilityList compatibility_list;
+@@ -199,7 +199,7 @@ class GameLibraryWorker : public QObject {
+ public:
+     explicit GameLibraryWorker(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
+                               FileSys::ManualContentProvider* provider_,
+-                              PlayTime::PlayTimeManager& play_time_manager_,
++                              SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                               Core::System& system_);
+     ~GameLibraryWorker() override;
+ 
+@@ -235,7 +235,7 @@ private:
+ 
+     std::shared_ptr<FileSys::VfsFilesystem> vfs;
+     FileSys::ManualContentProvider* provider;
+-    PlayTime::PlayTimeManager& play_time_manager;
++    SuyuPlayTime::PlayTimeManager& play_time_manager;
+     Core::System& system;
+     CompatibilityList compatibility_list;
+     std::atomic_bool stop_processing{false};
+diff --git a/src/suyu/game_list.cpp b/src/suyu/game_list.cpp
+index e2b3e9a..83d7a96 100644
+--- a/src/suyu/game_list.cpp
++++ b/src/suyu/game_list.cpp
+@@ -349,12 +349,19 @@ void GameList::OnFilterCloseClicked() {
+ }
+ 
+ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
+-                   PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
++                   SuyuPlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
+                    GMainWindow* parent)
+     : QWidget{parent}, vfs{std::move(vfs_)}, provider{provider_},
+       play_time_manager{play_time_manager_}, system{system_} {
+     watcher = new QFileSystemWatcher(this);
+-    connect(watcher, &QFileSystemWatcher::directoryChanged, this, &GameList::RefreshGameDirectory);
++    // A running game writes into the watched NAND and SDMC directories continuously, and each
++    // event used to rescan every game directory. Coalesce a burst of events into one reload.
++    refresh_timer = new QTimer(this);
++    refresh_timer->setSingleShot(true);
++    refresh_timer->setInterval(2000);
++    connect(refresh_timer, &QTimer::timeout, this, &GameList::RefreshGameDirectory);
++    connect(watcher, &QFileSystemWatcher::directoryChanged, this,
++            &GameList::OnWatchedDirectoryChanged);
+ 
+     this->main_window = parent;
+     layout = new QVBoxLayout;
+@@ -1051,6 +1058,11 @@ const QStringList GameList::supported_file_extensions = {
+     QStringLiteral("nso"), QStringLiteral("nro"), QStringLiteral("nca"),
+     QStringLiteral("xci"), QStringLiteral("nsp"), QStringLiteral("kip")};
+ 
++void GameList::OnWatchedDirectoryChanged(const QString& path) {
++    LOG_DEBUG(Frontend, "Watched directory changed: {}", path.toStdString());
++    refresh_timer->start();
++}
++
+ void GameList::RefreshGameDirectory() {
+     if (!UISettings::values.game_dirs.empty()) {
+         LOG_INFO(Frontend, "Change detected in the games directory. Reloading game list.");
+diff --git a/src/suyu/game_list.h b/src/suyu/game_list.h
+index 4711b9a..f4d3db4 100644
+--- a/src/suyu/game_list.h
++++ b/src/suyu/game_list.h
+@@ -12,6 +12,7 @@
+ #include <QList>
+ #include <QStandardItemModel>
+ #include <QString>
++#include <QTimer>
+ #include <QTreeView>
+ #include <QVBoxLayout>
+ #include <QVector>
+@@ -86,7 +87,7 @@ public:
+ 
+     explicit GameList(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
+                       FileSys::ManualContentProvider* provider_,
+-                      PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
++                      SuyuPlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
+                       GMainWindow* parent = nullptr);
+     ~GameList() override;
+ 
+@@ -162,6 +163,7 @@ private:
+ private:
+     void ValidateEntry(const QModelIndex& item);
+ 
++    void OnWatchedDirectoryChanged(const QString& path);
+     void RefreshGameDirectory();
+ 
+     void ToggleFavorite(u64 program_id);
+@@ -187,12 +189,13 @@ private:
+     QStandardItemModel* item_model = nullptr;
+     std::unique_ptr<GameListWorker> current_worker;
+     QFileSystemWatcher* watcher = nullptr;
++    QTimer* refresh_timer = nullptr;
+     ControllerNavigation* controller_navigation = nullptr;
+     CompatibilityList compatibility_list;
+ 
+     friend class GameListSearchField;
+ 
+-    const PlayTime::PlayTimeManager& play_time_manager;
++    const SuyuPlayTime::PlayTimeManager& play_time_manager;
+     Core::System& system;
+ };
+ 
+diff --git a/src/suyu/game_list_p.h b/src/suyu/game_list_p.h
+index 3b2ac69..976a42a 100644
+--- a/src/suyu/game_list_p.h
++++ b/src/suyu/game_list_p.h
+@@ -291,7 +291,7 @@ public:
+ 
+     void setData(const QVariant& value, int role) override {
+         qulonglong time_seconds = value.toULongLong();
+-        GameListItem::setData(PlayTime::ReadablePlayTime(time_seconds), Qt::DisplayRole);
++        GameListItem::setData(SuyuPlayTime::ReadablePlayTime(time_seconds), Qt::DisplayRole);
+         GameListItem::setData(value, PlayTimeRole);
+     }
+ 
+diff --git a/src/suyu/game_list_worker.cpp b/src/suyu/game_list_worker.cpp
+index 9e42972..55b19ee 100644
+--- a/src/suyu/game_list_worker.cpp
++++ b/src/suyu/game_list_worker.cpp
+@@ -201,7 +201,7 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
+                                         const std::size_t size, const std::vector<u8>& icon,
+                                         Loader::AppLoader& loader, u64 program_id,
+                                         const CompatibilityList& compatibility_list,
+-                                        const PlayTime::PlayTimeManager& play_time_manager,
++                                        const SuyuPlayTime::PlayTimeManager& play_time_manager,
+                                         const FileSys::PatchManager& patch) {
+     const auto it = FindMatchingCompatibilityEntry(compatibility_list, program_id);
+ 
+@@ -237,7 +237,7 @@ GameListWorker::GameListWorker(FileSys::VirtualFilesystem vfs_,
+                                FileSys::ManualContentProvider* provider_,
+                                QVector<UISettings::GameDir>& game_dirs_,
+                                const CompatibilityList& compatibility_list_,
+-                               const PlayTime::PlayTimeManager& play_time_manager_,
++                               const SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                                Core::System& system_)
+     : vfs{std::move(vfs_)}, provider{provider_}, game_dirs{game_dirs_},
+       compatibility_list{compatibility_list_}, play_time_manager{play_time_manager_}, system{
+diff --git a/src/suyu/game_list_worker.h b/src/suyu/game_list_worker.h
+index 1facc45..1b97a44 100644
+--- a/src/suyu/game_list_worker.h
++++ b/src/suyu/game_list_worker.h
+@@ -41,7 +41,7 @@ public:
+                             FileSys::ManualContentProvider* provider_,
+                             QVector<UISettings::GameDir>& game_dirs_,
+                             const CompatibilityList& compatibility_list_,
+-                            const PlayTime::PlayTimeManager& play_time_manager_,
++                            const SuyuPlayTime::PlayTimeManager& play_time_manager_,
+                             Core::System& system_);
+     ~GameListWorker() override;
+ 
+@@ -83,7 +83,7 @@ private:
+     FileSys::ManualContentProvider* provider;
+     QVector<UISettings::GameDir>& game_dirs;
+     const CompatibilityList& compatibility_list;
+-    const PlayTime::PlayTimeManager& play_time_manager;
++    const SuyuPlayTime::PlayTimeManager& play_time_manager;
+ 
+     QStringList watch_list;
+ 
+diff --git a/src/suyu/main.cpp b/src/suyu/main.cpp
+index cfcd1e2..ca38630 100644
+--- a/src/suyu/main.cpp
++++ b/src/suyu/main.cpp
+@@ -431,7 +431,7 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
+     SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
+     discord_rpc->Update();
+ 
+-    play_time_manager = std::make_unique<PlayTime::PlayTimeManager>(system->GetProfileManager());
++    play_time_manager = std::make_unique<SuyuPlayTime::PlayTimeManager>(system->GetProfileManager());
+ 
+     system->GetRoomNetwork().Init();
+ 
+diff --git a/src/suyu/main.h b/src/suyu/main.h
+index 31bed86..4d21193 100644
+--- a/src/suyu/main.h
++++ b/src/suyu/main.h
+@@ -96,7 +96,7 @@ namespace DiscordRPC {
+ class DiscordInterface;
+ }
+ 
+-namespace PlayTime {
++namespace SuyuPlayTime {
+ class PlayTimeManager;
+ }
+ 
+@@ -556,7 +556,7 @@ private:
+ 
+     std::unique_ptr<Core::System> system;
+     std::unique_ptr<DiscordRPC::DiscordInterface> discord_rpc;
+-    std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
++    std::unique_ptr<SuyuPlayTime::PlayTimeManager> play_time_manager;
+     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
+ 
+     MultiplayerState* multiplayer_state = nullptr;
+diff --git a/src/suyu/play_time_manager.cpp b/src/suyu/play_time_manager.cpp
+index 67980e5..41ab9ee 100644
+--- a/src/suyu/play_time_manager.cpp
++++ b/src/suyu/play_time_manager.cpp
+@@ -11,7 +11,7 @@
+ #include "core/hle/service/acc/profile_manager.h"
+ #include "suyu/play_time_manager.h"
+ 
+-namespace PlayTime {
++namespace SuyuPlayTime {
+ 
+ namespace {
+ 
+@@ -184,4 +184,4 @@ QString ReadablePlayTime(qulonglong time_seconds) {
+         .arg(QString::fromUtf8(unit));
+ }
+ 
+-} // namespace PlayTime
++} // namespace SuyuPlayTime
+diff --git a/src/suyu/play_time_manager.h b/src/suyu/play_time_manager.h
+index aabcf7b..b18e975 100644
+--- a/src/suyu/play_time_manager.h
++++ b/src/suyu/play_time_manager.h
+@@ -15,7 +15,7 @@ namespace Service::Account {
+ class ProfileManager;
+ }
+ 
+-namespace PlayTime {
++namespace SuyuPlayTime {
+ 
+ using ProgramId = u64;
+ using PlayTime = u64;
+@@ -48,4 +48,4 @@ private:
+ 
+ QString ReadablePlayTime(qulonglong time_seconds);
+ 
+-} // namespace PlayTime
++} // namespace SuyuPlayTime
+diff --git a/src/suyu/qt_common.cpp b/src/suyu/qt_common.cpp
+index 7b5b580..509abe2 100644
+--- a/src/suyu/qt_common.cpp
++++ b/src/suyu/qt_common.cpp
+@@ -12,6 +12,7 @@
+ #include <qpa/qplatformnativeinterface.h>
+ #elif defined(__APPLE__)
+ #include <objc/message.h>
++#include <objc/runtime.h>
+ #endif
+ 
+ namespace QtCommon {
+@@ -43,8 +44,41 @@ Core::Frontend::EmuWindow::WindowSystemInfo GetWindowSystemInfo(QWindow* window)
+     // Our Win32 Qt external doesn't have the private API.
+     wsi.render_surface = reinterpret_cast<void*>(window->winId());
+ #elif defined(__APPLE__)
+-    wsi.render_surface = reinterpret_cast<void* (*)(id, SEL)>(objc_msgSend)(
++    id layer = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(
+         reinterpret_cast<id>(window->winId()), sel_registerName("layer"));
++
++    // In Qt 6, the layer of the NSView might be a QContainerLayer.
++    // MoltenVK needs a CAMetalLayer, so search the sublayers for one.
++    Class metal_layer_class = objc_getClass("CAMetalLayer");
++    id metal_layer = nullptr;
++
++    if (layer) {
++        if (reinterpret_cast<bool (*)(id, SEL, Class)>(objc_msgSend)(
++                layer, sel_registerName("isKindOfClass:"), metal_layer_class)) {
++            metal_layer = layer;
++        } else {
++            id sublayers = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(
++                layer, sel_registerName("sublayers"));
++            if (sublayers) {
++                unsigned long count = reinterpret_cast<unsigned long (*)(id, SEL)>(objc_msgSend)(
++                    sublayers, sel_registerName("count"));
++                for (unsigned long i = 0; i < count; ++i) {
++                    id sublayer = reinterpret_cast<id (*)(id, SEL, unsigned long)>(objc_msgSend)(
++                        sublayers, sel_registerName("objectAtIndex:"), i);
++                    if (reinterpret_cast<bool (*)(id, SEL, Class)>(objc_msgSend)(
++                            sublayer, sel_registerName("isKindOfClass:"), metal_layer_class)) {
++                        metal_layer = sublayer;
++                        break;
++                    }
++                }
++            }
++        }
++    }
++
++    if (!metal_layer) {
++        LOG_WARNING(Frontend, "No CAMetalLayer found on the NSView; MoltenVK will likely fail");
++    }
++    wsi.render_surface = reinterpret_cast<void*>(metal_layer ? metal_layer : layer);
+ #else
+     QPlatformNativeInterface* pni = QGuiApplication::platformNativeInterface();
+     wsi.display_connection = pni->nativeResourceForWindow("display", window);
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9613975..ce07719 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1718,6 +1718,13 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+         }
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
++        // Record the written ranges. Without this a second upload into the same range in the
++        // same tick also passes CanReorderUpload and both copies land in the upload command
++        // buffer with no barrier between them: two unordered transfer writes, and the older
++        // data can win (SYNC-HAZARD-WRITE-AFTER-WRITE on vkCmdCopyBuffer).
++        for (const auto& copy : copies) {
++            buffer.MarkUsage(copy.dst_offset, copy.size);
++        }
+     }
+ }
+ 
+@@ -1760,6 +1767,13 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
++        // Record the written ranges. Without this a second upload into the same range in the
++        // same tick also passes CanReorderUpload and both copies land in the upload command
++        // buffer with no barrier between them: two unordered transfer writes, and the older
++        // data can win (SYNC-HAZARD-WRITE-AFTER-WRITE on vkCmdCopyBuffer).
++        for (const auto& copy : copies) {
++            buffer.MarkUsage(copy.dst_offset, copy.size);
++        }
+     } else {
+         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
+     }
+diff --git a/src/video_core/gpu_workarounds.h b/src/video_core/gpu_workarounds.h
+new file mode 100644
+index 0000000..262158e
+--- /dev/null
++++ b/src/video_core/gpu_workarounds.h
+@@ -0,0 +1,16 @@
++// SPDX-FileCopyrightText: 2026 suyu Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++
++namespace VideoCore {
++
++/// When set, a colour render target whose address equals an earlier bound target's address is
++/// dropped from the render pass. Guests bind one surface at several slots; Vulkan drivers on
++/// desktop tolerate it, Metal declares it undefined, and on Apple's tile-based GPUs the aliased
++/// attachments overwrite each other's tiles when the pass is stored.
++inline std::atomic<bool> dedupe_aliased_render_targets{false};
++
++} // namespace VideoCore
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 6d592d1..b0a67d3 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -382,7 +382,11 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
+             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+         }
+         u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-        std::memcpy(dest_buffer, physical, copy_amount);
++        if (physical != nullptr) [[likely]] {
++            std::memcpy(dest_buffer, physical, copy_amount);
++        } else {
++            std::memset(dest_buffer, 0, copy_amount);
++        }
+         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+@@ -395,7 +399,11 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
+             memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
+         } else {
+             u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-            std::memcpy(dest_buffer, physical, copy_amount);
++            if (physical != nullptr) [[likely]] {
++                std::memcpy(dest_buffer, physical, copy_amount);
++            } else {
++                std::memset(dest_buffer, 0, copy_amount);
++            }
+         }
+         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
+     };
+@@ -431,7 +439,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
+         }
+         u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-        std::memcpy(physical, src_buffer, copy_amount);
++        if (physical != nullptr) [[likely]] {
++            std::memcpy(physical, src_buffer, copy_amount);
++        }
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+@@ -444,7 +454,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+         } else {
+             u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-            std::memcpy(physical, src_buffer, copy_amount);
++            if (physical != nullptr) [[likely]] {
++                std::memcpy(physical, src_buffer, copy_amount);
++            }
+         }
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index 594e86f..587fbb4 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -452,7 +452,7 @@ void RecordShaderReadBarrier(Scheduler& scheduler, const ImageView& image_view)
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_SHADER_WRITE_BIT |
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+@@ -467,8 +467,10 @@ void RecordShaderReadBarrier(Scheduler& scheduler, const ImageView& image_view)
+                 VK_PIPELINE_STAGE_TRANSFER_BIT |
+                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            // The destination image may next be sampled or bound as an attachment and loaded;
++            // limiting visibility to fragment/compute shaders left attachment loads racing this
++            // barrier (SYNC-HAZARD-READ-AFTER-WRITE at vkCmdBeginRenderPass).
++            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+             0,
+             barrier);
+     });
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index 21ffaa3..bd5c884 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -13,6 +13,7 @@
+ #include "common/common_types.h"
+ #include "common/settings.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/gpu_workarounds.h"
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ #include "video_core/renderer_vulkan/vk_state_tracker.h"
+ 
+@@ -179,6 +180,21 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+     for (size_t i = 0; i < regs.rt.size(); ++i) {
+         color_formats[i] = static_cast<u8>(regs.rt[i].format);
+     }
++    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
++        for (size_t i = 1; i < regs.rt.size(); ++i) {
++            const GPUVAddr address = regs.rt[i].Address();
++            if (address == 0 || regs.rt[i].format == Tegra::RenderTargetFormat::NONE) {
++                continue;
++            }
++            for (size_t j = 0; j < i; ++j) {
++                if (regs.rt[j].Address() == address &&
++                    color_formats[j] != static_cast<u8>(Tegra::RenderTargetFormat::NONE)) {
++                    color_formats[i] = static_cast<u8>(Tegra::RenderTargetFormat::NONE);
++                    break;
++                }
++            }
++        }
++    }
+     alpha_test_ref = std::bit_cast<u32>(regs.alpha_test_ref);
+     point_size = std::bit_cast<u32>(regs.point_size);
+ 
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 2622e22..3ba05b7 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -6,12 +6,15 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cstddef>
++#include <cstdlib>
+ #include <optional>
+ 
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/common_types.h"
++#include "common/logging/log.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+ #include "shader_recompiler/shader_info.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+@@ -23,6 +26,7 @@
+ namespace Vulkan {
+ 
+ using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
++using Shader::Backend::SPIRV::NUM_TEXTURE_COMPARE_WORDS;
+ 
+ [[nodiscard]] inline std::optional<PixelFormat> PixelFormatFromImageFormat(
+     Shader::ImageFormat format) {
+@@ -184,6 +188,18 @@ public:
+             texture_bit = 1u;
+             ++texture_ptr;
+         }
++        ++texture_index;
++    }
++
++    /// Records the emulated depth compare bits of the texture PushTexture is about to push.
++    void PushTextureCompare(u32 compare_bits) noexcept {
++        if (texture_index < NUM_TEXTURE_COMPARE_WORDS * 8) {
++            compare_words[texture_index / 8] |= (compare_bits & 15u) << ((texture_index % 8) * 4);
++        }
++    }
++
++    const std::array<u32, NUM_TEXTURE_COMPARE_WORDS>& CompareData() const noexcept {
++        return compare_words;
+     }
+ 
+     void PushImage(bool is_rescaled) noexcept {
+@@ -201,6 +217,8 @@ public:
+ 
+ private:
+     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
++    std::array<u32, NUM_TEXTURE_COMPARE_WORDS> compare_words{};
++    u32 texture_index{};
+     u32* texture_ptr{words.data()};
+     u32* image_ptr{words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS};
+     u32 texture_bit{1u};
+@@ -217,13 +235,15 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+                                  GuestDescriptorQueue& guest_descriptor_queue,
+                                  const Shader::Info& info, RescalingPushConstant& rescaling,
+                                  const VideoCommon::SamplerId*& samplers,
+-                                 const VideoCommon::ImageViewInOut*& views) {
++                                 const VideoCommon::ImageViewInOut*& views,
++                                 bool emulate_depth_compare) {
+     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
+     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+     views += num_texture_buffers;
+     views += num_image_buffers;
+     for (const auto& desc : info.texture_descriptors) {
+         bool is_rescaled{};
++        u32 compare_bits{};
+         for (u32 index = 0; index < desc.count; ++index) {
+             const VideoCommon::ImageViewId image_view_id{(views++)->id};
+             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+@@ -234,6 +254,20 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+             }
+             const Sampler& sampler{texture_cache.GetSampler(sampler_id)};
++            // Diagnostic: is every sampled 1600x900 image one that has been rendered to?
++            if (image_view.size.width >= 1600 && image_view.size.height >= 900) {
++                ++g_large_sampled_total;
++                if (!IsKnownLargeRenderTarget(image_view.ImageHandle())) {
++                    if (const u64 n = ++g_large_sampled_not_rt; n % 500 == 1) {
++                        LOG_INFO(Render_Vulkan,
++                                 "Sampled large image that was never a render target: {}x{} "
++                                 "format {} ({} so far of {})",
++                                 image_view.size.width, image_view.size.height,
++                                 static_cast<u32>(image_view.format), n,
++                                 g_large_sampled_total.load());
++                    }
++                }
++            }
+             const bool use_fallback_sampler{sampler.HasAddedAnisotropy() &&
+                                             !image_view.SupportsAnisotropy()};
+             VkSampler vk_sampler{use_fallback_sampler ? sampler.HandleWithDefaultAnisotropy()
+@@ -242,14 +276,33 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+                 VideoCore::Surface::IsPixelFormatInteger(image_view.format)) {
+                 vk_sampler = sampler.HandleWithNearestFilter();
+             }
+-            if (desc.is_depth && sampler.HasDepthComparison() &&
+-                !image_view.SupportsDepthComparison()) {
+-                vk_sampler = sampler.HandleWithoutDepthComparison();
++            // Diagnostic: which depth-format images are read as plain (non-compare) textures.
++            if (!desc.is_depth && VideoCore::Surface::GetFormatType(image_view.format) !=
++                                      VideoCore::Surface::SurfaceType::ColorTexture) {
++                static std::atomic<u32> depth_as_color_reads{0};
++                if (const u32 n = ++depth_as_color_reads; n % 2000 == 1) {
++                    LOG_INFO(Render_Vulkan, "Depth-format image {} sampled as colour ({} so far)",
++                             static_cast<u32>(image_view.format), n);
++                }
++            }
++            if (desc.is_depth && sampler.HasDepthComparison()) {
++                if (emulate_depth_compare && !image_view.SupportsDepthComparison()) {
++                    // Colour-format texture compared against: the shader compares in code,
++                    // so hand it the guest compare function and sample the plain float
++                    // through a sampler without a compare op. Depth formats keep the native
++                    // hardware compare.
++                    compare_bits = sampler.DepthCompareFunc() |
++                                   (sampler.HasLinearFiltering() ? 8u : 0u);
++                    vk_sampler = sampler.HandleWithoutDepthComparison();
++                } else if (!image_view.SupportsDepthComparison()) {
++                    vk_sampler = sampler.HandleWithoutDepthComparison();
++                }
+             }
+             guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
+             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
++        rescaling.PushTextureCompare(compare_bits);
+         rescaling.PushTexture(is_rescaled);
+     }
+     for (const auto& desc : info.image_descriptors) {
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 869bd09..68ce2dd 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -29,6 +29,7 @@ namespace Vulkan {
+ 
+ using Shader::ImageBufferDescriptor;
+ using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
++using Shader::Backend::SPIRV::RESCALING_LAYOUT_COMPARE_OPS_OFFSET;
+ using Tegra::Texture::TexturePair;
+ 
+ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
+@@ -233,7 +234,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     const VideoCommon::SamplerId* samplers_it{samplers.data()};
+     const VideoCommon::ImageViewInOut* views_it{views.data()};
+     PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
+-                         views_it);
++                         views_it, device.IsMoltenVK());
+ 
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+@@ -251,8 +252,8 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+ 
+     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+-    scheduler.Record([this, descriptor_data, is_rescaling,
+-                      rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
++    scheduler.Record([this, descriptor_data, is_rescaling, rescaling_data = rescaling.Data(),
++                      compare_data = rescaling.CompareData()](vk::CommandBuffer cmdbuf) {
+         if (!pipeline) {
+             return;
+         }
+@@ -264,6 +265,11 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                  RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+                                  rescaling_data.data());
++            if (device.IsMoltenVK()) {
++                cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
++                                     RESCALING_LAYOUT_COMPARE_OPS_OFFSET, sizeof(compare_data),
++                                     compare_data.data());
++            }
+         }
+         if (uses_push_descriptor) {
+             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index e6dcbb3..c1561c0 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <iostream>
+ #include <span>
+ 
+@@ -43,6 +44,7 @@ using Shader::ImageBufferDescriptor;
+ using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
+ using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
+ using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
++using Shader::Backend::SPIRV::RESCALING_LAYOUT_COMPARE_OPS_OFFSET;
+ using Tegra::Texture::TexturePair;
+ using VideoCore::Surface::PixelFormat;
+ using VideoCore::Surface::PixelFormatFromDepthFormat;
+@@ -489,7 +491,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+         buffer_cache.BindHostStageBuffers(stage);
+         PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
+-                             samplers_it, views_it);
++                             samplers_it, views_it, device.IsMoltenVK());
+         const auto& info{stage_infos[stage]};
+         if (info.uses_render_area) {
+             render_area.uses_render_area = true;
+@@ -526,6 +528,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+ 
+ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                                      const RenderAreaPushConstant& render_area) {
++    // Diagnostic: SUYU_SPLIT_EVERY_DRAW=1 ends the render pass before every draw, so each
++    // draw loads and stores its attachments through memory.
++    static const bool split_every_draw = std::getenv("SUYU_SPLIT_EVERY_DRAW") != nullptr;
++    if (split_every_draw) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++    }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+@@ -547,7 +555,7 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+ 
+     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+     scheduler.Record([this, descriptor_data, bind_pipeline, rescaling_data = rescaling.Data(),
+-                      is_rescaling, update_rescaling,
++                      compare_data = rescaling.CompareData(), is_rescaling, update_rescaling,
+                       uses_render_area = render_area.uses_render_area,
+                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+         if (bind_pipeline) {
+@@ -556,6 +564,11 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+                              rescaling_data.data());
++        if (device.IsMoltenVK()) {
++            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
++                                 RESCALING_LAYOUT_COMPARE_OPS_OFFSET, sizeof(compare_data),
++                                 compare_data.data());
++        }
+         if (update_rescaling) {
+             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
+@@ -833,8 +846,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         for (size_t i = 0; i < mask_table.size(); ++i) {
+             write_mask |= mask[i] ? mask_table[i] : 0;
+         }
++        // Blending is ignored on integer attachments by Vulkan, but Metal refuses to build
++        // such a pipeline, so leave it off there explicitly.
++        const bool is_integer_attachment =
++            VideoCore::Surface::IsPixelFormatInteger(DecodeFormat(key.state.color_formats[index]));
+         cb_attachments.push_back({
+-            .blendEnable = blend.enable != 0,
++            .blendEnable = blend.enable != 0 && !is_integer_attachment,
+             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+             .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
+             .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index acf14a4..a80469a 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -72,6 +72,10 @@ class GraphicsPipeline {
+     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+ 
+ public:
++    [[nodiscard]] const std::array<u64, 6>& UniqueHashes() const noexcept {
++        return key.unique_hashes;
++    }
++
+     explicit GraphicsPipeline(
+         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
+         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index 5d2109c..0b3f0a9 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <functional>
++#include <atomic>
+ #include <thread>
+ 
+ #include <ranges>
+@@ -69,6 +71,18 @@ void MasterSemaphore::Refresh() {
+     do {
+         this_tick = gpu_tick.load(std::memory_order_acquire);
+         counter = semaphore.GetCounter();
++        // The GPU can never be ahead of the host: the highest value ever signalled is
++        // current_tick - 1. A driver that reports more (seen with MoltenVK) would make every
++        // IsFree() check pass and let command buffers, descriptor sets and staging memory be
++        // recycled while the GPU is still using them. Clamp and shout.
++        if (const u64 host_max = current_tick.load(std::memory_order_acquire) - 1; counter > host_max) {
++            static std::atomic<u32> reports{0};
++            if (reports.fetch_add(1) < 20) {
++                LOG_ERROR(Render_Vulkan, "Timeline semaphore counter {} is ahead of host tick {} - clamping",
++                          counter, host_max);
++            }
++            counter = host_max;
++        }
+         if (counter < this_tick) {
+             return;
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 418b061..a2030c5 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -251,6 +251,10 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+         if (device.IsMoltenVK()) {
+             for (size_t i = 0; i < 8; ++i) {
+                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
++                if (format == Tegra::RenderTargetFormat::NONE) {
++                    info.color_output_types[i] = Shader::AttributeType::Float;
++                    continue;
++                }
+                 const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+                 if (VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
+                     if (VideoCore::Surface::IsPixelFormatSignedInteger(pixel_format)) {
+@@ -432,6 +436,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         .has_broken_spirv_subgroup_mask_vector_extract_dynamic = false,
+         .has_broken_robust =
+             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
++        .emulate_depth_compare = device.IsMoltenVK(),
+         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
+         .max_user_clip_distances = device.GetMaxUserClipDistances()
+     };
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f63859f..13fcc1e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
++#include <fstream>
++#include <string>
+ #include <array>
+ #include <memory>
+ #include <mutex>
+@@ -32,7 +35,9 @@
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
++#include "video_core/gpu_workarounds.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/surface.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/renderer_vulkan/vk_state_tracker.h"
+@@ -45,6 +50,134 @@
+ 
+ namespace Vulkan {
+ 
++namespace {
++// Diagnostic: SUYU_DRAW_SKIP_FILE=<path> names a file holding "from to"; guest draws whose
++// per-frame index is in [from, to) are skipped. The file is re-read every 30 frames so the
++// range can be bisected while the game keeps running.
++struct DrawSkipFilter {
++    DrawSkipFilter() {
++        if (const char* env = std::getenv("SUYU_DRAW_SKIP_FILE")) {
++            path = env;
++        }
++    }
++    void Frame() {
++        if (path.empty()) {
++            return;
++        }
++        if (frames % 120 == 0) {
++            LOG_INFO(Render_Vulkan,
++                     "Draw skip: {} draws, {} depth clears, {} colour clears last frame; skipping "
++                     "[{}, {}) depth_clear_image={} split_clears={} no_stencil={}",
++                     draw_index, depth_clears, color_clears, from, to, depth_clear_image,
++                     split_clears, no_stencil);
++        if (frames % 120 == 0) {
++            LOG_INFO(Render_Vulkan, "Draw skip: biggest draws last frame {} {} {} {} (vertices x instances); skipped as big: {} (threshold {})",
++                     biggest[0], biggest[1], biggest[2], biggest[3], skipped_big, skip_big);
++        }
++        biggest = {};
++        skipped_big = 0;
++        if (frames % 120 == 0) {
++            LOG_INFO(Render_Vulkan,
++                     "Draw skip: colour clear image switch {}, large images created so far {}, "
++                     "large copies so far {}, large sampled {} of which never a render target {}",
++                     color_clear_image, g_large_images_created.load(), g_large_copies.load(),
++                     g_large_sampled_total.load(), g_large_sampled_not_rt.load());
++        }
++        }
++        draw_index = 0;
++        fmt_draw_counter = 0;
++        depth_clears = 0;
++        color_clears = 0;
++        if (++frames % 30 == 0) {
++            if (std::ifstream file{path}; file) {
++                u32 a{}, b{};
++                if (file >> a >> b) {
++                    from = a;
++                    to = b;
++                }
++                // Remaining lines: "key value" live switches.
++                std::string key;
++                u32 value{};
++                while (file >> key >> value) {
++                    if (key == "depth_clear_image") depth_clear_image = value != 0;
++                    if (key == "split_clears") split_clears = value != 0;
++                    if (key == "no_stencil") no_stencil = value != 0;
++                    if (key == "color_clear_image") color_clear_image = value != 0;
++                    if (key == "clear_index") clear_index = value;
++                    if (key == "dump_clear") dump_clear = value;
++                    if (key == "dump_draw") dump_draw = value;
++                    if (key == "dump_fmt") dump_fmt = value;
++                    if (key == "dump_w") dump_w = value;
++                    if (key == "dump_rt") dump_rt = value;
++                    if (key == "dump_depth") dump_depth = value != 0;
++                    if (key == "clear_via_image") clear_via_image = value != 0;
++                    if (key == "no_queries") no_queries = value != 0;
++                    if (key == "skip_big") skip_big = value;
++                    if (key == "pass_sync") g_debug_pass_sync.store(static_cast<int>(value));
++                }
++            }
++        }
++    }
++    bool depth_clear_image = false;
++    bool color_clear_image = false;
++    u32 clear_index = ~0u; ///< magenta only this colour clear of the frame (~0u: all)
++    u32 dump_clear = ~0u;  ///< dump the colour image of this clear of the frame to /tmp
++    u32 dump_draw = ~0u;   ///< dump the colour target just before this draw of the frame
++    u32 dump_fmt = ~0u;    ///< when set, dump_draw counts only draws whose RT0 has this format
++    u32 dump_w = ~0u;      ///< when set, also only draws whose RT0 has this width
++    u32 dump_rt = 0;       ///< which colour target the draw dump filters on and copies
++    bool dump_depth = false; ///< dump the depth aspect of the framebuffer instead of colour
++    bool clear_via_image = false; ///< do full colour clears with vkCmdClearColorImage
++    bool no_queries = false;      ///< never enable the ZPassPixelCount (occlusion) counter
++    u64 skip_big = 0;             ///< skip draws whose vertices x instances exceed this (0: off)
++    std::array<u64, 4> biggest{}; ///< largest draws of the frame (vertices x instances)
++    u32 skipped_big = 0;
++    void NoteDrawSize(u64 work) {
++        for (auto& b : biggest) {
++            if (work > b) {
++                std::swap(work, b);
++            }
++        }
++    }
++    u32 fmt_draw_counter = 0;
++    u32 last_draw_index = 0;
++    bool ShouldDump(u32 index) const {
++        return dump_clear == index && frames % 300 == 10;
++    }
++    bool ShouldMagenta(u32 index) const {
++        return color_clear_image && (clear_index == ~0u || clear_index == index);
++    }
++    bool ListClears() const {
++        return frames % 300 == 5;
++    }
++    bool split_clears = false;
++    bool no_stencil = false;
++    u32 depth_clears = 0;
++    u32 color_clears = 0;
++    bool Skip(const GraphicsPipeline& pipeline) {
++        if (path.empty()) {
++            return false;
++        }
++        const u32 index = draw_index++;
++        last_draw_index = index;
++        const bool skip = index >= from && index < to;
++        if (skip && to - from <= 8 && frames % 120 == 1) {
++            const auto& h = pipeline.UniqueHashes();
++            LOG_INFO(Render_Vulkan,
++                     "Draw skip: draw {} shaders {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}",
++                     index, h[0], h[1], h[2], h[3], h[4], h[5]);
++        }
++        return skip;
++    }
++    std::string path;
++    u32 draw_index = 0;
++    u32 from = ~0u;
++    u32 to = 0;
++    u32 frames = 0;
++};
++DrawSkipFilter g_draw_skip;
++} // Anonymous namespace
++
+ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+ using VideoCommon::ImageViewId;
+ using VideoCommon::ImageViewType;
+@@ -221,6 +354,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
+     scheduler.SetQueryCache(query_cache);
++    // Metal cannot have two colour attachments of one render pass alias the same memory; drop
++    // duplicate slots (see gpu_workarounds.h).
++    if (device.IsMoltenVK()) {
++        VideoCore::dedupe_aliased_render_targets.store(true, std::memory_order_relaxed);
++    }
+ }
+ 
+ RasterizerVulkan::~RasterizerVulkan() {
+@@ -234,6 +372,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     SCOPE_EXIT {
+         gpu.TickWork();
+     };
++    scheduler.DebugPassSync();
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -241,9 +380,50 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     if (!pipeline) {
+         return;
+     }
++    if (g_draw_skip.Skip(*pipeline)) {
++        return;
++    }
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
++    if (g_draw_skip.dump_draw != ~0u && g_draw_skip.frames % 300 == 10) {
++        const u32 rt = std::min<u32>(g_draw_skip.dump_rt, 7);
++        const auto rt0_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
++            maxwell3d->regs.rt[rt].format);
++        u32 index = g_draw_skip.last_draw_index;
++        bool eligible = maxwell3d->regs.rt[rt].format != Tegra::RenderTargetFormat::NONE;
++        if (eligible && g_draw_skip.dump_fmt != ~0u) {
++            eligible = static_cast<u32>(rt0_format) == g_draw_skip.dump_fmt;
++            if (eligible && g_draw_skip.dump_w != ~0u) {
++                eligible = maxwell3d->regs.rt[rt].width == g_draw_skip.dump_w;
++            }
++            if (eligible) {
++                index = g_draw_skip.fmt_draw_counter++;
++            }
++        }
++        if (eligible && (index % 200 == 0) && g_draw_skip.dump_depth) {
++            const auto& regs = maxwell3d->regs;
++            LOG_INFO(Render_Vulkan,
++                     "G-buffer draw {} (frame draw {}): depth test {} func {} write {} ; colour "
++                     "targets {} {} {} {} {} {} {} {} ; num RTs {}",
++                     index, g_draw_skip.last_draw_index, regs.depth_test_enable,
++                     static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
++                     static_cast<u32>(regs.rt[0].format), static_cast<u32>(regs.rt[1].format),
++                     static_cast<u32>(regs.rt[2].format), static_cast<u32>(regs.rt[3].format),
++                     static_cast<u32>(regs.rt[4].format), static_cast<u32>(regs.rt[5].format),
++                     static_cast<u32>(regs.rt[6].format), static_cast<u32>(regs.rt[7].format),
++                     regs.rt_control.count.Value());
++        }
++        // Before Configure binds state for this draw: dump the previous draw's target, which is
++        // the same render target set except at pass boundaries.
++        if (eligible && index == g_draw_skip.dump_draw) {
++            if (const Framebuffer* fb = texture_cache.GetFramebuffer(); fb != nullptr) {
++                DebugDumpColour(fb, rt0_format,
++                                fmt::format("rt{}draw{}of{}", rt, index, g_draw_skip.last_draw_index),
++                                rt);
++            }
++        }
++    }
+     if (!pipeline->Configure(is_indexed))
+         return;
+ 
+@@ -251,11 +431,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+     query_cache.NotifySegment(true);
+     HandleTransformFeedback();
+-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
++    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
++                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
+     draw_func();
+ }
+ 
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
++    {
++        // Diagnostic: size of this draw, and the skip_big switch.
++        const auto& draw_state = maxwell3d->draw_manager.draw_state;
++        const DrawParams params{MakeDrawParams(draw_state, instance_count, is_indexed)};
++        const u64 work = static_cast<u64>(params.num_vertices) * params.num_instances;
++        g_draw_skip.NoteDrawSize(work);
++        if (g_draw_skip.skip_big != 0 && work > g_draw_skip.skip_big) {
++            ++g_draw_skip.skipped_big;
++            return;
++        }
++    }
+     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+         const auto& draw_state = maxwell3d->draw_manager.draw_state;
+         const u32 num_instances{instance_count};
+@@ -360,7 +552,8 @@ void RasterizerVulkan::DrawTexture() {
+     UpdateDynamicStates();
+ 
+     query_cache.NotifySegment(true);
+-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
++    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
++                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
+     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
+     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
+     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
+@@ -393,7 +586,66 @@ void RasterizerVulkan::DrawTexture() {
+                          sampler->Handle(), dst_region, src_region, src_size);
+ }
+ 
++
++void RasterizerVulkan::DebugDumpColour(const Framebuffer* framebuffer,
++                                       VideoCore::Surface::PixelFormat pixel_format,
++                                       std::string_view tag, u32 colour_index) {
++    // Diagnostic: copy the n-th colour image (or the depth aspect) of the framebuffer to the host
++    // and write it to /tmp.
++    const bool want_depth = g_draw_skip.dump_depth;
++    u32 colour_seen = 0;
++    for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
++        const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
++        const bool is_colour = (range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
++        const bool is_depth = (range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
++        if (want_depth ? !is_depth : !is_colour) {
++            continue;
++        }
++        if (!want_depth && colour_seen++ != colour_index) {
++            continue;
++        }
++        const VkImageAspectFlags copy_aspect =
++            want_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++        if (want_depth) {
++            pixel_format = VideoCore::Surface::PixelFormat::R32_FLOAT; // D32 aspect copy: 4 bytes
++        }
++        const VkImage image = framebuffer->Images()[i];
++        const VkExtent2D render_area = framebuffer->RenderArea();
++        const u32 bpp = VideoCore::Surface::BytesPerBlock(pixel_format);
++        const u32 w = render_area.width;
++        const u32 h = render_area.height;
++        const size_t size = static_cast<size_t>(w) * h * bpp;
++        auto ref = staging_pool.Request(size, MemoryUsage::Download);
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([image, buffer = ref.buffer, offset = ref.offset, w, h,
++                          copy_aspect](vk::CommandBuffer cmdbuf) {
++            const VkBufferImageCopy copy{
++                .bufferOffset = offset,
++                .bufferRowLength = 0,
++                .bufferImageHeight = 0,
++                .imageSubresource{.aspectMask = copy_aspect,
++                                  .mipLevel = 0,
++                                  .baseArrayLayer = 0,
++                                  .layerCount = 1},
++                .imageOffset{0, 0, 0},
++                .imageExtent{w, h, 1},
++            };
++            cmdbuf.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_GENERAL, buffer, copy);
++        });
++        scheduler.Finish();
++        const std::string name =
++            fmt::format("/tmp/rtdump_{}_{}x{}_bpp{}_fmt{}_{}{}.raw", g_draw_skip.frames, w, h, bpp,
++                        static_cast<u32>(pixel_format), want_depth ? "depth" : "", tag);
++        std::ofstream out{name, std::ios::binary};
++        out.write(reinterpret_cast<const char*>(ref.mapped_span.data()),
++                  static_cast<std::streamsize>(size));
++        LOG_INFO(Render_Vulkan, "Dumped {}", name);
++        break;
++    }
++}
++
+ void RasterizerVulkan::Clear(u32 layer_count) {
++    scheduler.DebugPassSync();
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -410,10 +662,68 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+     texture_cache.UpdateRenderTargets(true);
+     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+     const VkExtent2D render_area = framebuffer->RenderArea();
++    // Diagnostic: SUYU_SPLIT_CLEARS=1 gives every vkCmdClearAttachments its own render pass.
++    static const bool split_clears = std::getenv("SUYU_SPLIT_CLEARS") != nullptr;
++    if (split_clears || g_draw_skip.split_clears) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++    }
++    if (use_depth || use_stencil) {
++        ++g_draw_skip.depth_clears;
++    }
++    const u32 color_clear_index = g_draw_skip.color_clears;
++    if (use_color) {
++        ++g_draw_skip.color_clears;
++        if (g_draw_skip.ListClears()) {
++            LOG_INFO(Render_Vulkan, "Colour clear {} of frame: target {}x{}, RT {}",
++                     color_clear_index, render_area.width, render_area.height,
++                     regs.clear_surface.RT.Value());
++        }
++    }
++    // Diagnostic: clear the whole depth/stencil image with vkCmdClearDepthStencilImage outside
++    // the render pass, instead of relying on the attachment clear alone.
++    if (g_draw_skip.depth_clear_image && (use_depth || use_stencil) &&
++        framebuffer->HasAspectDepthBit() && framebuffer->NumImages() > 0) {
++        const u32 depth_index = framebuffer->NumImages() - 1;
++        const VkImage depth_image = framebuffer->Images()[depth_index];
++        VkImageSubresourceRange range = framebuffer->ImageRanges()[depth_index];
++        const VkClearDepthStencilValue value{
++            .depth = regs.clear_depth,
++            .stencil = static_cast<u32>(regs.clear_stencil),
++        };
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([depth_image, range, value](vk::CommandBuffer cmdbuf) {
++            cmdbuf.ClearDepthStencilImage(depth_image, VK_IMAGE_LAYOUT_GENERAL, value, range);
++        });
++    }
++    const auto clear_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
++        regs.rt[regs.clear_surface.RT].format);
++    if (use_color && g_draw_skip.ShouldDump(color_clear_index)) {
++        DebugDumpColour(framebuffer, clear_format, "before");
++    }
++    // Diagnostic: clear every colour image of the framebuffer to magenta with
++    // vkCmdClearColorImage, so anything left unwritten afterwards is unmistakable.
++    if (use_color && g_draw_skip.ShouldMagenta(color_clear_index)) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++        for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
++            const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
++            if ((range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
++                continue;
++            }
++            const VkImage image = framebuffer->Images()[i];
++            scheduler.Record([image, range](vk::CommandBuffer cmdbuf) {
++                const VkClearColorValue magenta{.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
++                cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, magenta, range);
++            });
++        }
++        if (g_draw_skip.ShouldDump(color_clear_index)) {
++            DebugDumpColour(framebuffer, clear_format, "after");
++        }
++    }
+     scheduler.RequestRenderpass(framebuffer);
+ 
+     query_cache.NotifySegment(true);
+-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
++    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
++                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
+     u32 up_scale = 1;
+     u32 down_shift = 0;
+     if (texture_cache.IsRescaling()) {
+@@ -477,8 +787,20 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+         return;
+     }
+ 
+-    const u32 color_attachment = regs.clear_surface.RT;
+-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
++    u32 color_attachment = regs.clear_surface.RT;
++    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
++        // A clear through a dropped duplicate slot targets the first slot with that address.
++        const GPUVAddr address = regs.rt[color_attachment].Address();
++        for (u32 j = 0; j < color_attachment; ++j) {
++            if (regs.rt[j].Address() == address &&
++                regs.rt[j].format != Tegra::RenderTargetFormat::NONE) {
++                color_attachment = j;
++                break;
++            }
++        }
++    }
++    if (use_color && framebuffer->HasAspectColorBit(color_attachment) &&
++        regs.rt[color_attachment].format != Tegra::RenderTargetFormat::NONE) {
+         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
+         bool is_integer = IsPixelFormatInteger(format);
+         bool is_signed = IsPixelFormatSignedInteger(format);
+@@ -495,14 +817,45 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+         }
+ 
+         if (regs.clear_surface.R && regs.clear_surface.G && regs.clear_surface.B && regs.clear_surface.A) {
+-            scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
+-                const VkClearAttachment attachment{
+-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+-                    .colorAttachment = color_attachment,
+-                    .clearValue = clear_value,
+-                };
+-                cmdbuf.ClearAttachments(attachment, clear_rect);
+-            });
++            const bool full_rect = clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
++                                   clear_rect.rect.extent.width >= render_area.width &&
++                                   clear_rect.rect.extent.height >= render_area.height;
++            if (g_draw_skip.clear_via_image && full_rect) {
++                // Experiment: clear the whole image outside the render pass instead of a
++                // vkCmdClearAttachments quad inside it.
++                u32 colour_seen = 0;
++                for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
++                    const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
++                    if ((range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
++                        continue;
++                    }
++                    if (colour_seen++ != color_attachment) {
++                        continue;
++                    }
++                    const VkImage image = framebuffer->Images()[i];
++                    scheduler.RequestOutsideRenderPassOperationContext();
++                    scheduler.Record([image, range, color = clear_value.color](vk::CommandBuffer cmdbuf) {
++                        cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, color, range);
++                    });
++                    scheduler.RequestRenderpass(framebuffer);
++                    break;
++                }
++            } else {
++                scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
++                    const VkClearAttachment attachment{
++                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                        .colorAttachment = color_attachment,
++                        .clearValue = clear_value,
++                    };
++                    cmdbuf.ClearAttachments(attachment, clear_rect);
++                });
++            }
++            if (g_draw_skip.ShouldDump(color_clear_index)) {
++                // Memory right after the clear, which forces the render pass to end and store.
++                scheduler.RequestOutsideRenderPassOperationContext();
++                DebugDumpColour(framebuffer, clear_format, "postclear", color_attachment);
++                scheduler.RequestRenderpass(framebuffer);
++            }
+         } else {
+             u8 color_mask = u8(regs.clear_surface.R | regs.clear_surface.G << 1 | regs.clear_surface.B << 2 | regs.clear_surface.A << 3);
+             Region2D dst_region = {
+@@ -550,6 +903,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+ }
+ 
+ void RasterizerVulkan::DispatchCompute() {
++    // Diagnostic: SUYU_SKIP_COMPUTE=1 drops every guest compute dispatch.
++    static const bool skip_compute = std::getenv("SUYU_SKIP_COMPUTE") != nullptr;
++    if (skip_compute) {
++        return;
++    }
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -813,7 +1171,6 @@ void RasterizerVulkan::WaitForIdle() {
+     if (device.IsExtTransformFeedbackSupported()) {
+         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
+     }
+-
+     query_cache.NotifyWFI();
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
+@@ -842,6 +1199,7 @@ void RasterizerVulkan::FlushCommands() {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    g_draw_skip.Frame();
+     draw_counter = 0;
+     guest_descriptor_queue.TickFrame();
+     compute_pass_descriptor_queue.TickFrame();
+@@ -907,6 +1265,19 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
+     std::scoped_lock lock{texture_cache.mutex};
+     const auto [image_view, scaled] =
+         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
++    // Diagnostic: which route feeds the display.
++    static u64 display_calls = 0, display_raw = 0;
++    ++display_calls;
++    if (!image_view) {
++        ++display_raw;
++    }
++    if (display_calls % 120 == 1) {
++        LOG_INFO(Render_Vulkan,
++                 "Display: {} presents, {} through the raw guest-memory path; framebuffer {}x{} "
++                 "stride {} format {} addr {:#x} offset {:#x}",
++                 display_calls, display_raw, config.width, config.height, config.stride,
++                 static_cast<u32>(config.pixel_format), config.address, config.offset);
++    }
+     if (!image_view) {
+         return {};
+     }
+@@ -1800,6 +2171,10 @@ void RasterizerVulkan::UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& r
+ }
+ 
+ void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
++    if (g_draw_skip.no_stencil) {
++        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.SetStencilTestEnableEXT(false); });
++        return;
++    }
+     if (!state_tracker.TouchStencilTestEnable()) {
+         return;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 2f26f7e..a4afe2f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <string_view>
++
+ #include <array>
+ 
+ #include <boost/container/static_vector.hpp>
+@@ -24,6 +26,7 @@
+ #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
++#include "video_core/surface.h"
+ #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -137,6 +140,9 @@ public:
+     void BindChannel(Tegra::Control::ChannelState& channel) override;
+ 
+     void ReleaseChannel(s32 channel_id) override;
++    void DebugDumpColour(const Framebuffer* framebuffer, VideoCore::Surface::PixelFormat pixel_format,
++                         std::string_view tag, u32 colour_index = 0);
++
+     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
+                                                             VAddr framebuffer_addr,
+                                                             u32 pixel_stride);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index b6ca9b6..35aa675 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -27,6 +28,8 @@
+ 
+ namespace Vulkan {
+ 
++std::atomic<int> g_debug_pass_sync{0};
++
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+                                          vk::CommandBuffer upload_cmdbuf) {
+     auto command = first;
+@@ -93,6 +96,19 @@ void Scheduler::DispatchWork() {
+     }
+ }
+ 
++void Scheduler::DebugPassSync() {
++    // Diagnostic (g_debug_pass_sync): submit the previous render pass in its own command
++    // buffer, and optionally wait for the GPU, before the next draw or clear binds any state.
++    if (const int mode = g_debug_pass_sync.load(std::memory_order_relaxed);
++        mode > 0 && debug_pass_flush_pending) {
++        debug_pass_flush_pending = false;
++        Flush();
++        if (mode > 1) {
++            device.GetLogical().WaitIdle();
++        }
++    }
++}
++
+ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
+     const VkRenderPass renderpass = framebuffer->RenderPass();
+     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
+@@ -271,6 +287,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+         switch (const VkResult result = master_semaphore->SubmitQueue(
+                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+         case VK_SUCCESS:
++            // Diagnostic: SUYU_WAIT_IDLE_EVERY_SUBMIT=1 serialises the CPU against the GPU
++            // completely, which separates a CPU/GPU race from wrong content.
++            if (static const bool wait_idle = std::getenv("SUYU_WAIT_IDLE_EVERY_SUBMIT") != nullptr;
++                wait_idle) {
++                device.GetLogical().WaitIdle();
++            }
+             // Log successful queue submission
+             if (GPU::Logging::IsActive() &&
+                 Settings::values.gpu_log_vulkan_calls.GetValue()) {
+@@ -382,6 +404,7 @@ void Scheduler::EndRenderPass()
+ 
+         state.renderpass = VkRenderPass{};
+         num_renderpass_images = 0;
++        debug_pass_flush_pending = true;
+     }
+ 
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 6f4f869..7d2dc6f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <functional>
+@@ -28,6 +29,9 @@ class QueryCacheBase;
+ 
+ namespace Vulkan {
+ 
++/// Diagnostic: 1 = flush the command buffer after every render pass, 2 = also wait for the GPU.
++extern std::atomic<int> g_debug_pass_sync;
++
+ class CommandPool;
+ class Device;
+ class Framebuffer;
+@@ -49,6 +53,9 @@ public:
+     /// Sends the current execution context to the GPU and waits for it to complete.
+     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+ 
++    /// Diagnostic: see g_debug_pass_sync.
++    void DebugPassSync();
++
+     /// Waits for the worker thread to finish executing everything. After this function returns it's
+     /// safe to touch worker resources.
+     void WaitWorker();
+@@ -280,6 +287,7 @@ private:
+     std::function<void()> on_submit;
+ 
+     State state;
++    bool debug_pass_flush_pending = false;
+ 
+     u32 num_renderpass_images = 0;
+     std::array<VkImage, 9> renderpass_images{};
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c36be85..237a9f8 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <unordered_set>
++#include <mutex>
++#include <cstdlib>
+ #include <array>
+ #include <optional>
+ #include <span>
+@@ -37,6 +40,23 @@
+ 
+ namespace Vulkan {
+ 
++std::atomic<u64> g_large_images_created{0};
++std::atomic<u64> g_large_copies{0};
++std::atomic<u64> g_large_sampled_not_rt{0};
++std::atomic<u64> g_large_sampled_total{0};
++namespace {
++std::mutex g_large_rt_mutex;
++std::unordered_set<VkImage> g_large_rts;
++} // namespace
++void NoteLargeRenderTarget(VkImage image) {
++    std::scoped_lock lock{g_large_rt_mutex};
++    g_large_rts.insert(image);
++}
++bool IsKnownLargeRenderTarget(VkImage image) {
++    std::scoped_lock lock{g_large_rt_mutex};
++    return g_large_rts.contains(image);
++}
++
+ using Tegra::Engines::Fermi2D;
+ using Tegra::Texture::SwizzleSource;
+ using Tegra::Texture::TextureMipmapFilter;
+@@ -160,7 +180,10 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+         info.size.width == info.size.height && !device.HasBrokenCubeImageCompatibility()) {
+         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+     }
+-    if (info.type == ImageType::e3D) {
++    // Diagnostic: SUYU_NO_HEAP_FLAGS=1 drops the flag MoltenVK can only honour with MTLHeap,
++    // so the emulator can run with MVK_CONFIG_USE_MTLHEAP=0.
++    static const bool no_heap_flags = std::getenv("SUYU_NO_HEAP_FLAGS") != nullptr;
++    if (info.type == ImageType::e3D && !no_heap_flags) {
+         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+     }
+     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
+@@ -626,18 +649,18 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
+             .subresourceRange = subresource_range,
+     };
+ 
+-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++    // The texture may still be read by vertex/fragment shaders of earlier draws; the narrow
++    // LATE_FRAGMENT_TESTS | COLOR_ATTACHMENT_OUTPUT | COMPUTE_SHADER scope omitted them.
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            read_barrier);
+     cmdbuf.CopyBufferToImage(src_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
+     // TODO: Move this to another API
+-    cmdbuf.PipelineBarrier(
+-            VK_PIPELINE_STAGE_TRANSFER_BIT,
+-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+-            0, nullptr, nullptr, write_barrier);
++    // The uploaded texels are sampled by vertex and fragment shaders. The previous destination
++    // scope (LATE_FRAGMENT_TESTS | COMPUTE_SHADER | COLOR_ATTACHMENT_OUTPUT) did not include those
++    // stages, so drivers that honour barrier scopes precisely (MoltenVK/Metal) could sample the
++    // texture before the copy's writes were visible, showing tile-sized blocks of stale data.
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
++                           nullptr, nullptr, write_barrier);
+ }
+ 
+ [[nodiscard]] VkImageBlit MakeImageBlit(const Region2D& dst_region, const Region2D& src_region,
+@@ -996,6 +1019,10 @@ VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
+ }
+ 
+ void TextureCacheRuntime::BarrierFeedbackLoop() {
++    static std::atomic<u64> feedback_splits{0};
++    if (const u64 n = ++feedback_splits; n % 1000 == 1) {
++        LOG_INFO(Render_Vulkan, "Feedback loop render pass splits so far: {}", n);
++    }
+     scheduler.RequestOutsideRenderPassOperationContext();
+ }
+ 
+@@ -1442,6 +1469,14 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
+ 
+ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
+                                     std::span<const VideoCommon::ImageCopy> copies) {
++    if (dst.info.size.width >= 1600 && dst.info.size.height >= 900) {
++        if (const u64 n = ++g_large_copies; n % 100 == 1) {
++            LOG_INFO(Render_Vulkan, "Large copy #{}: {}x{} fmt {} -> {}x{} fmt {} ({} regions)", n,
++                     src.info.size.width, src.info.size.height, static_cast<u32>(src.info.format),
++                     dst.info.size.width, dst.info.size.height, static_cast<u32>(dst.info.format),
++                     copies.size());
++        }
++    }
+     // As per the size-compatible formats section of vulkan, copy manually via ReinterpretImage
+     // these images that aren't size-compatible
+     if (BytesPerBlock(src.info.format) != BytesPerBlock(dst.info.format)) {
+@@ -1538,16 +1573,14 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
+             },
+         };
+         cmdbuf.PipelineBarrier(
+-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 0, nullptr, nullptr, pre_barriers);
+         cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VideoCommon::FixSmallVectorADL(vk_copies));
+         cmdbuf.PipelineBarrier(
+                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 0, nullptr, nullptr, post_barriers);
+     });
+ }
+@@ -1591,6 +1624,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+                                    ? std::make_optional(VK_FORMAT_R32G32B32A32_SFLOAT)
+                                    : std::nullopt)),
+       aspect_mask(ImageAspectMask(info.format)) {
++    if (info.size.width >= 1600 && info.size.height >= 900) {
++        if (const u64 n = ++g_large_images_created; n % 25 == 1) {
++            LOG_INFO(Render_Vulkan, "Large image #{} created: {}x{} format {} type {}", n,
++                     info.size.width, info.size.height, static_cast<u32>(info.format),
++                     static_cast<u32>(info.type));
++        }
++    }
+     if (IsPixelFormatASTC(info.format) && !runtime->device.IsOptimalAstcSupported()) {
+         switch (Settings::values.accelerate_astc.GetValue()) {
+         case Settings::AstcDecodeMode::Gpu:
+@@ -2338,6 +2378,16 @@ vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_
+             break;
+         }
+     }
++    // Diagnostic (SUYU_NO_HEAP_FLAGS=1): without MTLHeap, MoltenVK cannot view a 3D texture as
++    // 2D or 2D array; fall back to a 3D view so the run survives (that texture samples wrong).
++    static const bool no_heap_flags = std::getenv("SUYU_NO_HEAP_FLAGS") != nullptr;
++    if (no_heap_flags && slot_images != nullptr &&
++        (*slot_images)[image_id].info.type == ImageType::e3D &&
++        (view_type == VK_IMAGE_VIEW_TYPE_2D || view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY)) {
++        view_type = VK_IMAGE_VIEW_TYPE_3D;
++        subresource_range.baseArrayLayer = 0;
++        subresource_range.layerCount = 1;
++    }
+     return device->GetLogical().CreateImageView({
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .pNext = nullptr,
+@@ -2440,6 +2490,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+     }
+     if (tsc.depth_compare_enabled) {
+         sampler_noncompare = create_sampler(max_anisotropy, false, true);
++        depth_compare_func = static_cast<u32>(tsc.depth_compare_func.Value());
+     }
+ }
+ 
+@@ -2450,6 +2501,13 @@ Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM
+           .height = key.size.height,
+       }} {
+     CreateFramebuffer(runtime, color_buffers, depth_buffer, key.is_rescaled);
++    // Diagnostic: one line per unique render target set, to see what the guest renders into.
++    LOG_INFO(Render_Vulkan, "Framebuffer {}", VideoCommon::Name(key));
++    if (key.size.width >= 1600 && key.size.height >= 900) {
++        for (u32 i = 0; i < num_images; ++i) {
++            NoteLargeRenderTarget(images[i]);
++        }
++    }
+     if (runtime.device.HasDebuggingToolAttached()) {
+         framebuffer.SetObjectNameEXT(VideoCommon::Name(key).c_str());
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 5d6577f..62be4ef 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <span>
+ 
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -23,6 +25,17 @@ struct ResolutionScalingInfo;
+ 
+ namespace Vulkan {
+ 
++/// Diagnostic: number of texture cache images of at least 1600x900 created so far.
++extern std::atomic<u64> g_large_images_created;
++/// Diagnostic: number of image-to-image copies whose destination is at least 1600x900.
++extern std::atomic<u64> g_large_copies;
++/// Diagnostic: VkImage handles of every image at least 1600x900 that has been a render target.
++void NoteLargeRenderTarget(VkImage image);
++/// Diagnostic: true when the image has been a render target (see NoteLargeRenderTarget).
++bool IsKnownLargeRenderTarget(VkImage image);
++extern std::atomic<u64> g_large_sampled_not_rt;
++extern std::atomic<u64> g_large_sampled_total;
++
+ using Common::SlotVector;
+ using VideoCommon::ImageId;
+ using VideoCommon::NUM_RT;
+@@ -430,7 +443,13 @@ public:
+         return static_cast<bool>(sampler_noncompare);
+     }
+ 
++    /// Guest DepthCompareFunc (bit 0 less, bit 1 equal, bit 2 greater)
++    [[nodiscard]] u32 DepthCompareFunc() const noexcept {
++        return depth_compare_func;
++    }
++
+ private:
++    u32 depth_compare_func{};
+     vk::Sampler sampler;
+     vk::Sampler sampler_default_anisotropy;
+     vk::Sampler sampler_nearest;
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 5b23948..3927bc8 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -399,6 +399,12 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
+         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+ }
+ 
++bool GraphicsEnvironment::IsTexturePixelFormatDepth(u32 handle) {
++    return VideoCore::Surface::GetFormatType(
++               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
++           VideoCore::Surface::SurfaceType::ColorTexture;
++}
++
+ u32 GraphicsEnvironment::ReadViewportTransformState() {
+     const auto& regs{maxwell3d->regs};
+     viewport_transform_state = regs.viewport_scale_offset_enabled;
+@@ -454,6 +460,12 @@ bool ComputeEnvironment::IsTexturePixelFormatInteger(u32 handle) {
+         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+ }
+ 
++bool ComputeEnvironment::IsTexturePixelFormatDepth(u32 handle) {
++    return VideoCore::Surface::GetFormatType(
++               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
++           VideoCore::Surface::SurfaceType::ColorTexture;
++}
++
+ u32 ComputeEnvironment::ReadViewportTransformState() {
+     return viewport_transform_state;
+ }
+@@ -562,6 +574,12 @@ bool FileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
+         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+ }
+ 
++bool FileEnvironment::IsTexturePixelFormatDepth(u32 handle) {
++    return VideoCore::Surface::GetFormatType(
++               static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle))) !=
++           VideoCore::Surface::SurfaceType::ColorTexture;
++}
++
+ u32 FileEnvironment::ReadViewportTransformState() {
+     return viewport_transform_state;
+ }
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index ac09d37..b360257 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -120,6 +120,8 @@ public:
+ 
+     bool IsTexturePixelFormatInteger(u32 handle) override;
+ 
++    bool IsTexturePixelFormatDepth(u32 handle) override;
++
+     u32 ReadViewportTransformState() override;
+ 
+     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
+@@ -146,6 +148,8 @@ public:
+ 
+     bool IsTexturePixelFormatInteger(u32 handle) override;
+ 
++    bool IsTexturePixelFormatDepth(u32 handle) override;
++
+     u32 ReadViewportTransformState() override;
+ 
+     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(
+@@ -180,6 +184,8 @@ public:
+ 
+     [[nodiscard]] bool IsTexturePixelFormatInteger(u32 handle) override;
+ 
++    [[nodiscard]] bool IsTexturePixelFormatDepth(u32 handle) override;
++
+     [[nodiscard]] u32 ReadViewportTransformState() override;
+ 
+     [[nodiscard]] u32 LocalMemorySize() const override;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index a1a99e6..16dbc85 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <limits>
+ #include <optional>
+ #include <bit>
+@@ -22,6 +24,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/samples_helper.h"
++#include "video_core/gpu_workarounds.h"
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/textures/decoders.h"
+@@ -260,36 +263,27 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
+     const u32 depth_bit = 1u << NUM_RT;
+     const bool depth_active = (rt_active_mask & depth_bit) != 0;
+ 
++    // Any sampled view of an image that is also a bound colour or depth attachment is a
++    // feedback loop. Upstream yuzu splits the render pass for every such case; this fork had
++    // narrowed it to a *different* view of the depth image only. On a tile-based GPU (Apple,
++    // via MoltenVK) reading the attachment being rendered returns whatever each tile last
++    // flushed to memory, which shows up as a screen-aligned grid of stale tiles, so the full
++    // check is restored.
+     const bool requires_barrier = [&] {
+         for (const auto& view : views) {
+             if (!view.id) {
+                 continue;
+             }
+-
+-            {
+-                bool is_continue = false;
+-                for (size_t i = 0; i < 8; ++i)
+-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
+-                if (is_continue)
+-                    continue;
+-            }
+-
+-            if (depth_active && view.id == render_targets.depth_buffer_id)
+-                continue;
+-
+             const ImageId view_image_id = slot_image_views[view.id].image_id;
+-            {
+-                bool is_continue = false;
+-                for (size_t i = 0; i < 8; ++i)
+-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
+-                if (is_continue)
+-                    continue;
++            for (size_t i = 0; i < NUM_RT; ++i) {
++                if ((rt_active_mask & (1u << i)) != 0 && view_image_id == rt_image_id[i]) {
++                    return true;
++                }
+             }
+             if (depth_active && view_image_id == rt_depth_image_id) {
+                 return true;
+             }
+         }
+-
+         return false;
+     }();
+ 
+@@ -1074,6 +1068,15 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
+                                               size_t buffer_offset,
+                                               std::span<const VideoCommon::BufferImageCopy> copies,
+                                               GPUVAddr address, size_t size) {
++    // Diagnostic: a render-target sized image being downloaded to guest memory.
++    if (image->info.size.width >= 1600 && image->info.size.height >= 900) {
++        static std::atomic<u64> large_downloads{0};
++        if (const u64 n = ++large_downloads; n % 20 == 1) {
++            LOG_INFO(HW_GPU, "Large image downloaded to guest memory: {}x{} format {} gpu_addr {:#x} ({} so far)",
++                     image->info.size.width, image->info.size.height,
++                     static_cast<u32>(image->info.format), image->gpu_addr, n);
++        }
++    }
+     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
+         const BufferDownload new_buffer_download{address, size};
+         auto slot = slot_buffer_downloads.insert(new_buffer_download);
+@@ -1102,6 +1105,18 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         return;
+     }
+ 
++    // Diagnostic: a render-target sized image being re-uploaded from guest memory.
++    if (image.info.size.width >= 1600 && image.info.size.height >= 900) {
++        static std::atomic<u64> large_refreshes{0};
++        if (const u64 n = ++large_refreshes; n % 20 == 1) {
++            LOG_INFO(HW_GPU,
++                     "Large image refreshed from guest memory: {}x{} format {} gpu_addr {:#x} "
++                     "gpu_modified {} ({} so far)",
++                     image.info.size.width, image.info.size.height,
++                     static_cast<u32>(image.info.format), image.gpu_addr,
++                     True(image.flags & ImageFlagBits::GpuModified), n);
++        }
++    }
+     image.flags &= ~ImageFlagBits::CpuModified;
+ 
+     TrackImage(image, image_id);
+@@ -1952,6 +1967,14 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
+     if (rt.format == Tegra::RenderTargetFormat::NONE) {
+         return ImageViewId{};
+     }
++    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
++        for (size_t j = 0; j < index; ++j) {
++            if (regs.rt[j].Address() == gpu_addr &&
++                regs.rt[j].format != Tegra::RenderTargetFormat::NONE) {
++                return ImageViewId{};
++            }
++        }
++    }
+     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
+     return FindRenderTargetView(info, gpu_addr);
+ }
+diff --git a/src/video_core/video_core.cpp b/src/video_core/video_core.cpp
+index 68b7fc1..abf6dd4 100644
+--- a/src/video_core/video_core.cpp
++++ b/src/video_core/video_core.cpp
+@@ -58,10 +58,16 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
+     try {
+         auto renderer = CreateRenderer(system, emu_window, *gpu, std::move(context));
+         gpu->BindRenderer(std::move(renderer));
+-    } catch (const std::runtime_error& exception) {
++    } catch (const std::exception& exception) {
+         scope.Cancel();
+         LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
+         gpu.reset();
++    } catch (...) {
++        // The renderer took ownership of the context and destroyed it while unwinding, so the
++        // Scoped guard must not call DoneCurrent() on it regardless of the exception type.
++        scope.Cancel();
++        LOG_ERROR(HW_GPU, "Failed to initialize GPU: unknown exception");
++        gpu.reset();
+     }
+ }
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 9ce1b8c..3d523f0 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <bitset>
+ #include <chrono>
+@@ -802,6 +803,15 @@ void Device::SaveShader(std::span<const u32> spirv) const {
+ }
+ 
+ bool Device::ComputeIsOptimalAstcSupported() const {
++#ifdef __APPLE__
++    // Diagnostic switch. SUYU_FORCE_ASTC_DECODE=1 makes suyu treat native ASTC as unsupported so
++    // ASTC textures are decoded to RGBA8 and uploaded through the uncompressed copy path instead of
++    // as compressed blocks. Used to bisect the block-displacement corruption seen on MoltenVK.
++    if (const char* force = std::getenv("SUYU_FORCE_ASTC_DECODE"); force && force[0] == '1') {
++        LOG_WARNING(Render_Vulkan, "SUYU_FORCE_ASTC_DECODE=1: ignoring native ASTC support");
++        return false;
++    }
++#endif
+     static constexpr std::array<VkFormat, 28> astc_formats = {
+         VK_FORMAT_ASTC_4x4_UNORM_BLOCK,   VK_FORMAT_ASTC_4x4_SRGB_BLOCK,
+         VK_FORMAT_ASTC_5x4_UNORM_BLOCK,   VK_FORMAT_ASTC_5x4_SRGB_BLOCK,
+@@ -1029,10 +1039,19 @@ bool Device::GetSuitability(bool requires_swapchain) {
+     // Base Vulkan 1.0 features are always valid regardless of instance version.
+     features.features = features2.features;
+ 
++#ifdef __APPLE__
++    // On macOS the only Vulkan implementation is MoltenVK, but properties.driver is not
++    // populated until GetProperties2() further below, so IsMoltenVK() still reads a zeroed
++    // driverID at this point and the MoltenVK fallback below would never trigger.
++    const bool is_moltenvk_early = true;
++#else
++    const bool is_moltenvk_early = IsMoltenVK();
++#endif
++
+ // Some features are mandatory. Check those.
+ #define CHECK_FEATURE(feature, name)                                                               \
+     if (!features.feature.name) {                                                                  \
+-        if (IsMoltenVK() && (strcmp(#name, "geometryShader") == 0 ||                               \
++        if (is_moltenvk_early && (strcmp(#name, "geometryShader") == 0 ||                               \
+                             strcmp(#name, "logicOp") == 0 ||                                       \
+                             strcmp(#name, "shaderCullDistance") == 0 ||                            \
+                             strcmp(#name, "wideLines") == 0)) {                                    \
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index d4f0db7..76e65f4 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <bit>
+ #include <limits>
+ #include <optional>
+@@ -304,6 +305,12 @@ namespace Vulkan {
+         const auto vma_usage = MemoryUsageVma(usage);
+         VmaAllocationCreateInfo ci{};
+         ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
++        // Diagnostic: SUYU_DEDICATED_IMAGES=1 gives every image its own VkDeviceMemory, so no
++        // two images share a MoltenVK heap.
++        static const bool dedicated_images = std::getenv("SUYU_DEDICATED_IMAGES") != nullptr;
++        if (dedicated_images) {
++            ci.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
++        }
+         ci.usage = vma_usage;
+         ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
+         ci.requiredFlags = 0;
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index 301ae1c..fcc0a04 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -102,6 +102,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
+     X(vkCmdBlitImage);
+     X(vkCmdClearAttachments);
+     X(vkCmdClearColorImage);
++    X(vkCmdClearDepthStencilImage);
+     X(vkCmdCopyBuffer);
+     X(vkCmdCopyBufferToImage);
+     X(vkCmdCopyImage);
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index 9f9cb5d..7ac255d 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -218,6 +218,7 @@ struct DeviceDispatch : InstanceDispatch {
+     PFN_vkCmdBlitImage vkCmdBlitImage{};
+     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
+     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
++    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
+     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
+     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
+     PFN_vkCmdCopyImage vkCmdCopyImage{};
+@@ -1275,6 +1276,12 @@ public:
+                                    rects.data());
+     }
+ 
++    void ClearDepthStencilImage(VkImage image, VkImageLayout layout,
++                                const VkClearDepthStencilValue& value,
++                                const VkImageSubresourceRange& range) const noexcept {
++        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, 1, &range);
++    }
++
+     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
+                          Span<VkImageSubresourceRange> ranges) {
+         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());

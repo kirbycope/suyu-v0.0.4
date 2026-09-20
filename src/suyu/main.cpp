@@ -431,7 +431,7 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
     SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
     discord_rpc->Update();
 
-    play_time_manager = std::make_unique<PlayTime::PlayTimeManager>(system->GetProfileManager());
+    play_time_manager = std::make_unique<SuyuPlayTime::PlayTimeManager>(system->GetProfileManager());
 
     system->GetRoomNetwork().Init();
 

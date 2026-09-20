@@ -11,7 +11,7 @@
 #include "core/hle/service/acc/profile_manager.h"
 #include "suyu/play_time_manager.h"
 
-namespace PlayTime {
+namespace SuyuPlayTime {
 
 namespace {
 
@@ -184,4 +184,4 @@ QString ReadablePlayTime(qulonglong time_seconds) {
         .arg(QString::fromUtf8(unit));
 }
 
-} // namespace PlayTime
+} // namespace SuyuPlayTime

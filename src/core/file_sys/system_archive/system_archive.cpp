@@ -76,6 +76,13 @@ constexpr inline SystemArchiveDescriptor GetSystemArchive(u64 title_id) {
 
 VirtualFile SynthesizeSystemArchive(const u64 title_id) {
     auto const desc = GetSystemArchive(title_id);
+    if (desc.name == nullptr) {
+        // fmt throws format_error on a null const char*, and an exception escaping the FS
+        // service thread aborts the process. Report the unknown archive and let the caller
+        // return "target not found" to the guest instead.
+        LOG_WARNING(Service_FS, "Unknown system archive requested (0x{:016X}).", title_id);
+        return nullptr;
+    }
     LOG_INFO(Service_FS, "Synthesizing system archive '{}' (0x{:016X}).", desc.name, title_id);
     if (desc.supplier != nullptr) {
         if (auto const dir = desc.supplier(); dir != nullptr) {

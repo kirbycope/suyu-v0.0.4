@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -22,6 +24,17 @@ struct ResolutionScalingInfo;
 }
 
 namespace Vulkan {
+
+/// Diagnostic: number of texture cache images of at least 1600x900 created so far.
+extern std::atomic<u64> g_large_images_created;
+/// Diagnostic: number of image-to-image copies whose destination is at least 1600x900.
+extern std::atomic<u64> g_large_copies;
+/// Diagnostic: VkImage handles of every image at least 1600x900 that has been a render target.
+void NoteLargeRenderTarget(VkImage image);
+/// Diagnostic: true when the image has been a render target (see NoteLargeRenderTarget).
+bool IsKnownLargeRenderTarget(VkImage image);
+extern std::atomic<u64> g_large_sampled_not_rt;
+extern std::atomic<u64> g_large_sampled_total;
 
 using Common::SlotVector;
 using VideoCommon::ImageId;
@@ -430,7 +443,13 @@ public:
         return static_cast<bool>(sampler_noncompare);
     }
 
+    /// Guest DepthCompareFunc (bit 0 less, bit 1 equal, bit 2 greater)
+    [[nodiscard]] u32 DepthCompareFunc() const noexcept {
+        return depth_compare_func;
+    }
+
 private:
+    u32 depth_compare_func{};
     vk::Sampler sampler;
     vk::Sampler sampler_default_anisotropy;
     vk::Sampler sampler_nearest;

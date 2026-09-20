@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <string_view>
+
 #include <array>
 
 #include <boost/container/static_vector.hpp>
@@ -24,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -137,6 +140,9 @@ public:
     void BindChannel(Tegra::Control::ChannelState& channel) override;
 
     void ReleaseChannel(s32 channel_id) override;
+    void DebugDumpColour(const Framebuffer* framebuffer, VideoCore::Surface::PixelFormat pixel_format,
+                         std::string_view tag, u32 colour_index = 0);
+
     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);

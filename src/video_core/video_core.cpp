@@ -58,9 +58,15 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     try {
         auto renderer = CreateRenderer(system, emu_window, *gpu, std::move(context));
         gpu->BindRenderer(std::move(renderer));
-    } catch (const std::runtime_error& exception) {
+    } catch (const std::exception& exception) {
         scope.Cancel();
         LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
+        gpu.reset();
+    } catch (...) {
+        // The renderer took ownership of the context and destroyed it while unwinding, so the
+        // Scoped guard must not call DoneCurrent() on it regardless of the exception type.
+        scope.Cancel();
+        LOG_ERROR(HW_GPU, "Failed to initialize GPU: unknown exception");
         gpu.reset();
     }
 }

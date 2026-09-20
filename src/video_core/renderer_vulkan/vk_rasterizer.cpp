@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <fstream>
+#include <string>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -32,7 +35,9 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/gpu_workarounds.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -44,6 +49,134 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+namespace {
+// Diagnostic: SUYU_DRAW_SKIP_FILE=<path> names a file holding "from to"; guest draws whose
+// per-frame index is in [from, to) are skipped. The file is re-read every 30 frames so the
+// range can be bisected while the game keeps running.
+struct DrawSkipFilter {
+    DrawSkipFilter() {
+        if (const char* env = std::getenv("SUYU_DRAW_SKIP_FILE")) {
+            path = env;
+        }
+    }
+    void Frame() {
+        if (path.empty()) {
+            return;
+        }
+        if (frames % 120 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Draw skip: {} draws, {} depth clears, {} colour clears last frame; skipping "
+                     "[{}, {}) depth_clear_image={} split_clears={} no_stencil={}",
+                     draw_index, depth_clears, color_clears, from, to, depth_clear_image,
+                     split_clears, no_stencil);
+        if (frames % 120 == 0) {
+            LOG_INFO(Render_Vulkan, "Draw skip: biggest draws last frame {} {} {} {} (vertices x instances); skipped as big: {} (threshold {})",
+                     biggest[0], biggest[1], biggest[2], biggest[3], skipped_big, skip_big);
+        }
+        biggest = {};
+        skipped_big = 0;
+        if (frames % 120 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Draw skip: colour clear image switch {}, large images created so far {}, "
+                     "large copies so far {}, large sampled {} of which never a render target {}",
+                     color_clear_image, g_large_images_created.load(), g_large_copies.load(),
+                     g_large_sampled_total.load(), g_large_sampled_not_rt.load());
+        }
+        }
+        draw_index = 0;
+        fmt_draw_counter = 0;
+        depth_clears = 0;
+        color_clears = 0;
+        if (++frames % 30 == 0) {
+            if (std::ifstream file{path}; file) {
+                u32 a{}, b{};
+                if (file >> a >> b) {
+                    from = a;
+                    to = b;
+                }
+                // Remaining lines: "key value" live switches.
+                std::string key;
+                u32 value{};
+                while (file >> key >> value) {
+                    if (key == "depth_clear_image") depth_clear_image = value != 0;
+                    if (key == "split_clears") split_clears = value != 0;
+                    if (key == "no_stencil") no_stencil = value != 0;
+                    if (key == "color_clear_image") color_clear_image = value != 0;
+                    if (key == "clear_index") clear_index = value;
+                    if (key == "dump_clear") dump_clear = value;
+                    if (key == "dump_draw") dump_draw = value;
+                    if (key == "dump_fmt") dump_fmt = value;
+                    if (key == "dump_w") dump_w = value;
+                    if (key == "dump_rt") dump_rt = value;
+                    if (key == "dump_depth") dump_depth = value != 0;
+                    if (key == "clear_via_image") clear_via_image = value != 0;
+                    if (key == "no_queries") no_queries = value != 0;
+                    if (key == "skip_big") skip_big = value;
+                    if (key == "pass_sync") g_debug_pass_sync.store(static_cast<int>(value));
+                }
+            }
+        }
+    }
+    bool depth_clear_image = false;
+    bool color_clear_image = false;
+    u32 clear_index = ~0u; ///< magenta only this colour clear of the frame (~0u: all)
+    u32 dump_clear = ~0u;  ///< dump the colour image of this clear of the frame to /tmp
+    u32 dump_draw = ~0u;   ///< dump the colour target just before this draw of the frame
+    u32 dump_fmt = ~0u;    ///< when set, dump_draw counts only draws whose RT0 has this format
+    u32 dump_w = ~0u;      ///< when set, also only draws whose RT0 has this width
+    u32 dump_rt = 0;       ///< which colour target the draw dump filters on and copies
+    bool dump_depth = false; ///< dump the depth aspect of the framebuffer instead of colour
+    bool clear_via_image = false; ///< do full colour clears with vkCmdClearColorImage
+    bool no_queries = false;      ///< never enable the ZPassPixelCount (occlusion) counter
+    u64 skip_big = 0;             ///< skip draws whose vertices x instances exceed this (0: off)
+    std::array<u64, 4> biggest{}; ///< largest draws of the frame (vertices x instances)
+    u32 skipped_big = 0;
+    void NoteDrawSize(u64 work) {
+        for (auto& b : biggest) {
+            if (work > b) {
+                std::swap(work, b);
+            }
+        }
+    }
+    u32 fmt_draw_counter = 0;
+    u32 last_draw_index = 0;
+    bool ShouldDump(u32 index) const {
+        return dump_clear == index && frames % 300 == 10;
+    }
+    bool ShouldMagenta(u32 index) const {
+        return color_clear_image && (clear_index == ~0u || clear_index == index);
+    }
+    bool ListClears() const {
+        return frames % 300 == 5;
+    }
+    bool split_clears = false;
+    bool no_stencil = false;
+    u32 depth_clears = 0;
+    u32 color_clears = 0;
+    bool Skip(const GraphicsPipeline& pipeline) {
+        if (path.empty()) {
+            return false;
+        }
+        const u32 index = draw_index++;
+        last_draw_index = index;
+        const bool skip = index >= from && index < to;
+        if (skip && to - from <= 8 && frames % 120 == 1) {
+            const auto& h = pipeline.UniqueHashes();
+            LOG_INFO(Render_Vulkan,
+                     "Draw skip: draw {} shaders {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}",
+                     index, h[0], h[1], h[2], h[3], h[4], h[5]);
+        }
+        return skip;
+    }
+    std::string path;
+    u32 draw_index = 0;
+    u32 from = ~0u;
+    u32 to = 0;
+    u32 frames = 0;
+};
+DrawSkipFilter g_draw_skip;
+} // Anonymous namespace
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
@@ -221,6 +354,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
+    // Metal cannot have two colour attachments of one render pass alias the same memory; drop
+    // duplicate slots (see gpu_workarounds.h).
+    if (device.IsMoltenVK()) {
+        VideoCore::dedupe_aliased_render_targets.store(true, std::memory_order_relaxed);
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -234,6 +372,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     SCOPE_EXIT {
         gpu.TickWork();
     };
+    scheduler.DebugPassSync();
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -241,9 +380,50 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (!pipeline) {
         return;
     }
+    if (g_draw_skip.Skip(*pipeline)) {
+        return;
+    }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
+    if (g_draw_skip.dump_draw != ~0u && g_draw_skip.frames % 300 == 10) {
+        const u32 rt = std::min<u32>(g_draw_skip.dump_rt, 7);
+        const auto rt0_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+            maxwell3d->regs.rt[rt].format);
+        u32 index = g_draw_skip.last_draw_index;
+        bool eligible = maxwell3d->regs.rt[rt].format != Tegra::RenderTargetFormat::NONE;
+        if (eligible && g_draw_skip.dump_fmt != ~0u) {
+            eligible = static_cast<u32>(rt0_format) == g_draw_skip.dump_fmt;
+            if (eligible && g_draw_skip.dump_w != ~0u) {
+                eligible = maxwell3d->regs.rt[rt].width == g_draw_skip.dump_w;
+            }
+            if (eligible) {
+                index = g_draw_skip.fmt_draw_counter++;
+            }
+        }
+        if (eligible && (index % 200 == 0) && g_draw_skip.dump_depth) {
+            const auto& regs = maxwell3d->regs;
+            LOG_INFO(Render_Vulkan,
+                     "G-buffer draw {} (frame draw {}): depth test {} func {} write {} ; colour "
+                     "targets {} {} {} {} {} {} {} {} ; num RTs {}",
+                     index, g_draw_skip.last_draw_index, regs.depth_test_enable,
+                     static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+                     static_cast<u32>(regs.rt[0].format), static_cast<u32>(regs.rt[1].format),
+                     static_cast<u32>(regs.rt[2].format), static_cast<u32>(regs.rt[3].format),
+                     static_cast<u32>(regs.rt[4].format), static_cast<u32>(regs.rt[5].format),
+                     static_cast<u32>(regs.rt[6].format), static_cast<u32>(regs.rt[7].format),
+                     regs.rt_control.count.Value());
+        }
+        // Before Configure binds state for this draw: dump the previous draw's target, which is
+        // the same render target set except at pass boundaries.
+        if (eligible && index == g_draw_skip.dump_draw) {
+            if (const Framebuffer* fb = texture_cache.GetFramebuffer(); fb != nullptr) {
+                DebugDumpColour(fb, rt0_format,
+                                fmt::format("rt{}draw{}of{}", rt, index, g_draw_skip.last_draw_index),
+                                rt);
+            }
+        }
+    }
     if (!pipeline->Configure(is_indexed))
         return;
 
@@ -251,11 +431,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
     draw_func();
 }
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    {
+        // Diagnostic: size of this draw, and the skip_big switch.
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        const DrawParams params{MakeDrawParams(draw_state, instance_count, is_indexed)};
+        const u64 work = static_cast<u64>(params.num_vertices) * params.num_instances;
+        g_draw_skip.NoteDrawSize(work);
+        if (g_draw_skip.skip_big != 0 && work > g_draw_skip.skip_big) {
+            ++g_draw_skip.skipped_big;
+            return;
+        }
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -360,7 +552,8 @@ void RasterizerVulkan::DrawTexture() {
     UpdateDynamicStates();
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -393,7 +586,66 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
+
+void RasterizerVulkan::DebugDumpColour(const Framebuffer* framebuffer,
+                                       VideoCore::Surface::PixelFormat pixel_format,
+                                       std::string_view tag, u32 colour_index) {
+    // Diagnostic: copy the n-th colour image (or the depth aspect) of the framebuffer to the host
+    // and write it to /tmp.
+    const bool want_depth = g_draw_skip.dump_depth;
+    u32 colour_seen = 0;
+    for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
+        const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
+        const bool is_colour = (range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+        const bool is_depth = (range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+        if (want_depth ? !is_depth : !is_colour) {
+            continue;
+        }
+        if (!want_depth && colour_seen++ != colour_index) {
+            continue;
+        }
+        const VkImageAspectFlags copy_aspect =
+            want_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        if (want_depth) {
+            pixel_format = VideoCore::Surface::PixelFormat::R32_FLOAT; // D32 aspect copy: 4 bytes
+        }
+        const VkImage image = framebuffer->Images()[i];
+        const VkExtent2D render_area = framebuffer->RenderArea();
+        const u32 bpp = VideoCore::Surface::BytesPerBlock(pixel_format);
+        const u32 w = render_area.width;
+        const u32 h = render_area.height;
+        const size_t size = static_cast<size_t>(w) * h * bpp;
+        auto ref = staging_pool.Request(size, MemoryUsage::Download);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([image, buffer = ref.buffer, offset = ref.offset, w, h,
+                          copy_aspect](vk::CommandBuffer cmdbuf) {
+            const VkBufferImageCopy copy{
+                .bufferOffset = offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource{.aspectMask = copy_aspect,
+                                  .mipLevel = 0,
+                                  .baseArrayLayer = 0,
+                                  .layerCount = 1},
+                .imageOffset{0, 0, 0},
+                .imageExtent{w, h, 1},
+            };
+            cmdbuf.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_GENERAL, buffer, copy);
+        });
+        scheduler.Finish();
+        const std::string name =
+            fmt::format("/tmp/rtdump_{}_{}x{}_bpp{}_fmt{}_{}{}.raw", g_draw_skip.frames, w, h, bpp,
+                        static_cast<u32>(pixel_format), want_depth ? "depth" : "", tag);
+        std::ofstream out{name, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(ref.mapped_span.data()),
+                  static_cast<std::streamsize>(size));
+        LOG_INFO(Render_Vulkan, "Dumped {}", name);
+        break;
+    }
+}
+
 void RasterizerVulkan::Clear(u32 layer_count) {
+    scheduler.DebugPassSync();
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -410,10 +662,68 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    // Diagnostic: SUYU_SPLIT_CLEARS=1 gives every vkCmdClearAttachments its own render pass.
+    static const bool split_clears = std::getenv("SUYU_SPLIT_CLEARS") != nullptr;
+    if (split_clears || g_draw_skip.split_clears) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+    if (use_depth || use_stencil) {
+        ++g_draw_skip.depth_clears;
+    }
+    const u32 color_clear_index = g_draw_skip.color_clears;
+    if (use_color) {
+        ++g_draw_skip.color_clears;
+        if (g_draw_skip.ListClears()) {
+            LOG_INFO(Render_Vulkan, "Colour clear {} of frame: target {}x{}, RT {}",
+                     color_clear_index, render_area.width, render_area.height,
+                     regs.clear_surface.RT.Value());
+        }
+    }
+    // Diagnostic: clear the whole depth/stencil image with vkCmdClearDepthStencilImage outside
+    // the render pass, instead of relying on the attachment clear alone.
+    if (g_draw_skip.depth_clear_image && (use_depth || use_stencil) &&
+        framebuffer->HasAspectDepthBit() && framebuffer->NumImages() > 0) {
+        const u32 depth_index = framebuffer->NumImages() - 1;
+        const VkImage depth_image = framebuffer->Images()[depth_index];
+        VkImageSubresourceRange range = framebuffer->ImageRanges()[depth_index];
+        const VkClearDepthStencilValue value{
+            .depth = regs.clear_depth,
+            .stencil = static_cast<u32>(regs.clear_stencil),
+        };
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([depth_image, range, value](vk::CommandBuffer cmdbuf) {
+            cmdbuf.ClearDepthStencilImage(depth_image, VK_IMAGE_LAYOUT_GENERAL, value, range);
+        });
+    }
+    const auto clear_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+        regs.rt[regs.clear_surface.RT].format);
+    if (use_color && g_draw_skip.ShouldDump(color_clear_index)) {
+        DebugDumpColour(framebuffer, clear_format, "before");
+    }
+    // Diagnostic: clear every colour image of the framebuffer to magenta with
+    // vkCmdClearColorImage, so anything left unwritten afterwards is unmistakable.
+    if (use_color && g_draw_skip.ShouldMagenta(color_clear_index)) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+        for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
+            const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
+            if ((range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
+                continue;
+            }
+            const VkImage image = framebuffer->Images()[i];
+            scheduler.Record([image, range](vk::CommandBuffer cmdbuf) {
+                const VkClearColorValue magenta{.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
+                cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, magenta, range);
+            });
+        }
+        if (g_draw_skip.ShouldDump(color_clear_index)) {
+            DebugDumpColour(framebuffer, clear_format, "after");
+        }
+    }
     scheduler.RequestRenderpass(framebuffer);
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              maxwell3d->regs.zpass_pixel_count_enable && !g_draw_skip.no_queries);
     u32 up_scale = 1;
     u32 down_shift = 0;
     if (texture_cache.IsRescaling()) {
@@ -477,8 +787,20 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         return;
     }
 
-    const u32 color_attachment = regs.clear_surface.RT;
-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
+    u32 color_attachment = regs.clear_surface.RT;
+    if (VideoCore::dedupe_aliased_render_targets.load(std::memory_order_relaxed)) {
+        // A clear through a dropped duplicate slot targets the first slot with that address.
+        const GPUVAddr address = regs.rt[color_attachment].Address();
+        for (u32 j = 0; j < color_attachment; ++j) {
+            if (regs.rt[j].Address() == address &&
+                regs.rt[j].format != Tegra::RenderTargetFormat::NONE) {
+                color_attachment = j;
+                break;
+            }
+        }
+    }
+    if (use_color && framebuffer->HasAspectColorBit(color_attachment) &&
+        regs.rt[color_attachment].format != Tegra::RenderTargetFormat::NONE) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         bool is_integer = IsPixelFormatInteger(format);
         bool is_signed = IsPixelFormatSignedInteger(format);
@@ -495,14 +817,45 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         }
 
         if (regs.clear_surface.R && regs.clear_surface.G && regs.clear_surface.B && regs.clear_surface.A) {
-            scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
-                const VkClearAttachment attachment{
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .colorAttachment = color_attachment,
-                    .clearValue = clear_value,
-                };
-                cmdbuf.ClearAttachments(attachment, clear_rect);
-            });
+            const bool full_rect = clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
+                                   clear_rect.rect.extent.width >= render_area.width &&
+                                   clear_rect.rect.extent.height >= render_area.height;
+            if (g_draw_skip.clear_via_image && full_rect) {
+                // Experiment: clear the whole image outside the render pass instead of a
+                // vkCmdClearAttachments quad inside it.
+                u32 colour_seen = 0;
+                for (u32 i = 0; i < framebuffer->NumImages(); ++i) {
+                    const VkImageSubresourceRange range = framebuffer->ImageRanges()[i];
+                    if ((range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
+                        continue;
+                    }
+                    if (colour_seen++ != color_attachment) {
+                        continue;
+                    }
+                    const VkImage image = framebuffer->Images()[i];
+                    scheduler.RequestOutsideRenderPassOperationContext();
+                    scheduler.Record([image, range, color = clear_value.color](vk::CommandBuffer cmdbuf) {
+                        cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, color, range);
+                    });
+                    scheduler.RequestRenderpass(framebuffer);
+                    break;
+                }
+            } else {
+                scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
+                    const VkClearAttachment attachment{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .colorAttachment = color_attachment,
+                        .clearValue = clear_value,
+                    };
+                    cmdbuf.ClearAttachments(attachment, clear_rect);
+                });
+            }
+            if (g_draw_skip.ShouldDump(color_clear_index)) {
+                // Memory right after the clear, which forces the render pass to end and store.
+                scheduler.RequestOutsideRenderPassOperationContext();
+                DebugDumpColour(framebuffer, clear_format, "postclear", color_attachment);
+                scheduler.RequestRenderpass(framebuffer);
+            }
         } else {
             u8 color_mask = u8(regs.clear_surface.R | regs.clear_surface.G << 1 | regs.clear_surface.B << 2 | regs.clear_surface.A << 3);
             Region2D dst_region = {
@@ -550,6 +903,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
+    // Diagnostic: SUYU_SKIP_COMPUTE=1 drops every guest compute dispatch.
+    static const bool skip_compute = std::getenv("SUYU_SKIP_COMPUTE") != nullptr;
+    if (skip_compute) {
+        return;
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -813,7 +1171,6 @@ void RasterizerVulkan::WaitForIdle() {
     if (device.IsExtTransformFeedbackSupported()) {
         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
     }
-
     query_cache.NotifyWFI();
 
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -842,6 +1199,7 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    g_draw_skip.Frame();
     draw_counter = 0;
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
@@ -907,6 +1265,19 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
+    // Diagnostic: which route feeds the display.
+    static u64 display_calls = 0, display_raw = 0;
+    ++display_calls;
+    if (!image_view) {
+        ++display_raw;
+    }
+    if (display_calls % 120 == 1) {
+        LOG_INFO(Render_Vulkan,
+                 "Display: {} presents, {} through the raw guest-memory path; framebuffer {}x{} "
+                 "stride {} format {} addr {:#x} offset {:#x}",
+                 display_calls, display_raw, config.width, config.height, config.stride,
+                 static_cast<u32>(config.pixel_format), config.address, config.offset);
+    }
     if (!image_view) {
         return {};
     }
@@ -1800,6 +2171,10 @@ void RasterizerVulkan::UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& r
 }
 
 void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+    if (g_draw_skip.no_stencil) {
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.SetStencilTestEnableEXT(false); });
+        return;
+    }
     if (!state_tracker.TouchStencilTestEnable()) {
         return;
     }

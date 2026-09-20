@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <bitset>
 #include <chrono>
@@ -802,6 +803,15 @@ void Device::SaveShader(std::span<const u32> spirv) const {
 }
 
 bool Device::ComputeIsOptimalAstcSupported() const {
+#ifdef __APPLE__
+    // Diagnostic switch. SUYU_FORCE_ASTC_DECODE=1 makes suyu treat native ASTC as unsupported so
+    // ASTC textures are decoded to RGBA8 and uploaded through the uncompressed copy path instead of
+    // as compressed blocks. Used to bisect the block-displacement corruption seen on MoltenVK.
+    if (const char* force = std::getenv("SUYU_FORCE_ASTC_DECODE"); force && force[0] == '1') {
+        LOG_WARNING(Render_Vulkan, "SUYU_FORCE_ASTC_DECODE=1: ignoring native ASTC support");
+        return false;
+    }
+#endif
     static constexpr std::array<VkFormat, 28> astc_formats = {
         VK_FORMAT_ASTC_4x4_UNORM_BLOCK,   VK_FORMAT_ASTC_4x4_SRGB_BLOCK,
         VK_FORMAT_ASTC_5x4_UNORM_BLOCK,   VK_FORMAT_ASTC_5x4_SRGB_BLOCK,
@@ -1029,10 +1039,19 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Base Vulkan 1.0 features are always valid regardless of instance version.
     features.features = features2.features;
 
+#ifdef __APPLE__
+    // On macOS the only Vulkan implementation is MoltenVK, but properties.driver is not
+    // populated until GetProperties2() further below, so IsMoltenVK() still reads a zeroed
+    // driverID at this point and the MoltenVK fallback below would never trigger.
+    const bool is_moltenvk_early = true;
+#else
+    const bool is_moltenvk_early = IsMoltenVK();
+#endif
+
 // Some features are mandatory. Check those.
 #define CHECK_FEATURE(feature, name)                                                               \
     if (!features.feature.name) {                                                                  \
-        if (IsMoltenVK() && (strcmp(#name, "geometryShader") == 0 ||                               \
+        if (is_moltenvk_early && (strcmp(#name, "geometryShader") == 0 ||                               \
                             strcmp(#name, "logicOp") == 0 ||                                       \
                             strcmp(#name, "shaderCullDistance") == 0 ||                            \
                             strcmp(#name, "wideLines") == 0)) {                                    \

@@ -1718,6 +1718,13 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+        // Record the written ranges. Without this a second upload into the same range in the
+        // same tick also passes CanReorderUpload and both copies land in the upload command
+        // buffer with no barrier between them: two unordered transfer writes, and the older
+        // data can win (SYNC-HAZARD-WRITE-AFTER-WRITE on vkCmdCopyBuffer).
+        for (const auto& copy : copies) {
+            buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
     }
 }
 
@@ -1760,6 +1767,13 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+        // Record the written ranges. Without this a second upload into the same range in the
+        // same tick also passes CanReorderUpload and both copies land in the upload command
+        // buffer with no barrier between them: two unordered transfer writes, and the older
+        // data can win (SYNC-HAZARD-WRITE-AFTER-WRITE on vkCmdCopyBuffer).
+        for (const auto& copy : copies) {
+            buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
     } else {
         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
     }

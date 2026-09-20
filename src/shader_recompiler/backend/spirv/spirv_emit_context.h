@@ -43,6 +43,7 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    bool is_depth_image;
 };
 
 struct TextureBufferDefinition {
@@ -303,6 +304,8 @@ public:
     u32 rescaling_textures_member_index{};
     u32 rescaling_images_member_index{};
     u32 rescaling_downfactor_member_index{};
+    Id compare_ops_type{};
+    u32 compare_ops_member_index{};
     u32 texture_rescaling_index{};
     u32 image_rescaling_index{};
 

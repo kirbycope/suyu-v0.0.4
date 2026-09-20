@@ -29,6 +29,7 @@ namespace Vulkan {
 
 using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
+using Shader::Backend::SPIRV::RESCALING_LAYOUT_COMPARE_OPS_OFFSET;
 using Tegra::Texture::TexturePair;
 
 ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
@@ -233,7 +234,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
-                         views_it);
+                         views_it, device.IsMoltenVK());
 
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -251,8 +252,8 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
-    scheduler.Record([this, descriptor_data, is_rescaling,
-                      rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, descriptor_data, is_rescaling, rescaling_data = rescaling.Data(),
+                      compare_data = rescaling.CompareData()](vk::CommandBuffer cmdbuf) {
         if (!pipeline) {
             return;
         }
@@ -264,6 +265,11 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                  RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                                  rescaling_data.data());
+            if (device.IsMoltenVK()) {
+                cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                     RESCALING_LAYOUT_COMPARE_OPS_OFFSET, sizeof(compare_data),
+                                     compare_data.data());
+            }
         }
         if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,

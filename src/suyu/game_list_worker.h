@@ -41,7 +41,7 @@ public:
                             FileSys::ManualContentProvider* provider_,
                             QVector<UISettings::GameDir>& game_dirs_,
                             const CompatibilityList& compatibility_list_,
-                            const PlayTime::PlayTimeManager& play_time_manager_,
+                            const SuyuPlayTime::PlayTimeManager& play_time_manager_,
                             Core::System& system_);
     ~GameListWorker() override;
 
@@ -83,7 +83,7 @@ private:
     FileSys::ManualContentProvider* provider;
     QVector<UISettings::GameDir>& game_dirs;
     const CompatibilityList& compatibility_list;
-    const PlayTime::PlayTimeManager& play_time_manager;
+    const SuyuPlayTime::PlayTimeManager& play_time_manager;
 
     QStringList watch_list;
 

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -26,6 +27,8 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+std::atomic<int> g_debug_pass_sync{0};
 
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
                                          vk::CommandBuffer upload_cmdbuf) {
@@ -90,6 +93,19 @@ void Scheduler::DispatchWork() {
         }
         event_cv.notify_all();
         AcquireNewChunk();
+    }
+}
+
+void Scheduler::DebugPassSync() {
+    // Diagnostic (g_debug_pass_sync): submit the previous render pass in its own command
+    // buffer, and optionally wait for the GPU, before the next draw or clear binds any state.
+    if (const int mode = g_debug_pass_sync.load(std::memory_order_relaxed);
+        mode > 0 && debug_pass_flush_pending) {
+        debug_pass_flush_pending = false;
+        Flush();
+        if (mode > 1) {
+            device.GetLogical().WaitIdle();
+        }
     }
 }
 
@@ -271,6 +287,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            // Diagnostic: SUYU_WAIT_IDLE_EVERY_SUBMIT=1 serialises the CPU against the GPU
+            // completely, which separates a CPU/GPU race from wrong content.
+            if (static const bool wait_idle = std::getenv("SUYU_WAIT_IDLE_EVERY_SUBMIT") != nullptr;
+                wait_idle) {
+                device.GetLogical().WaitIdle();
+            }
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {
@@ -382,6 +404,7 @@ void Scheduler::EndRenderPass()
 
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
+        debug_pass_flush_pending = true;
     }
 
 

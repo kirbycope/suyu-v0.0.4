@@ -218,6 +218,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
+    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
     PFN_vkCmdCopyImage vkCmdCopyImage{};
@@ -1273,6 +1274,12 @@ public:
                           Span<VkClearRect> rects) const noexcept {
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
+    }
+
+    void ClearDepthStencilImage(VkImage image, VkImageLayout layout,
+                                const VkClearDepthStencilValue& value,
+                                const VkImageSubresourceRange& range) const noexcept {
+        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, 1, &range);
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
