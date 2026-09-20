@@ -701,7 +701,7 @@ Plus `~/.config/vulkan/icd.d/MoltenVK_icd.json`, written by hand as above.
 | Firmware 22.5.0 | `~/.local/share/suyu/nand/system/Contents/registered/` (229 files, 322 MB) |
 | Config | `~/.config/suyu/qt-config.ini` - note this build reads `Paths\romsPath`, not `Paths\gamedirs` |
 | Log | `~/.local/share/suyu/log/suyu_log.txt` |
-| Source, builds | `~/GitHub/suyu/{build,build-dbg,build-d0,build-asan}` |
+| Source, build | `~/GitHub/suyu-v0.0.4` (the fork clone), Release build in `build/` |
 
 **Do not put ROMs in `~/Documents` on this Mac.** It is an iCloud Drive folder; iCloud
 continuously touches files there, suyu rescans its game directory on every change
