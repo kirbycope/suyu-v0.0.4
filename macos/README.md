@@ -176,6 +176,7 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DYUZU_TESTS=OFF \
   -DVulkanHeaders_FORCE_BUNDLED=ON \
+  -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
   -DUSE_SYSTEM_MOLTENVK=ON \
   -DENABLE_LIBUSB=OFF \
   -DYUZU_USE_QT_MULTIMEDIA=OFF \
@@ -191,7 +192,8 @@ cmake --build build            # ~2.5 min on an M4 Pro, 1683 targets
 Then copy `libvulkan.1.dylib` into `build/bin/suyu.app/Contents/Frameworks/`.
 
 Why each non-obvious flag: `VulkanHeaders_FORCE_BUNDLED` avoids a system-headers mismatch that
-`vulkan-loader` drags in; `USE_SYSTEM_MOLTENVK` skips a call to an undefined CMake macro
+`vulkan-loader` drags in, and `VulkanUtilityLibraries_FORCE_BUNDLED` must go with it or CPM stops
+with "partial dependency installation detected"; `USE_SYSTEM_MOLTENVK` skips a call to an undefined CMake macro
 (`download_moltenvk_external`, defined in a module that is never included) and gets MoltenVK 1.4.2
 instead of the hardcoded 1.2.8; `ENABLE_LIBUSB=OFF` because the bundled libusb dereferences a
 null function pointer in `usbi_create_event` on macOS 26 (costs GameCube-adapter support only).
